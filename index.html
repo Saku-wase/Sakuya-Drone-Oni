@@ -1906,6 +1906,7 @@ function frame(now) {
   }
   netFrame(dt);
   oniFrame(dt);
+  botFrame(dt);
   hudTimer -= dt; if (hudTimer <= 0) { hudTimer = 0.1; updateHud(); }
   renderer.render(scene, camera);
   {
@@ -1997,7 +1998,7 @@ function netFrame(dt) {
   const room = NET.room;
   if (!room) return;
   NET.sendT -= dt;
-  if (NET.sendT <= 0 && grid) { NET.sendT = 1 / 15; room.presence(myPresence()).catch(() => {}); }
+  if (NET.sendT <= 0 && grid) { NET.sendT = 1 / 15; room.presence(netPresence()).catch(() => {}); }
   const now = performance.now();
   const seen = new Set();
   for (const peer of room.peers()) {
@@ -2094,6 +2095,7 @@ function setReady(v) {
   if (NET.room) NET.room.presence({ rd: NET.ready }).catch(() => {});
 }
 function checkReady(list) {
+  if (BOT.on) { $('readystat').textContent = 'ボットと対戦中'; NET.allSince = 0; return; }
   const now = performance.now();
   const n = list.length, ok = list.filter((e) => e.pr.rd === true).length;
   $('readystat').textContent = NET.raceActive ? 'ラウンド中です。終わったら、準備OKで次のラウンドを始められます（準備OK ' + ok + ' / ' + n + ' 人）' : '準備OK ' + ok + ' / ' + n + ' 人' + (n > 1 ? '　全員そろうと自動でスタートします' : '　2人以上で遊べます。リンクを共有して友達を呼ぼう');
@@ -2351,7 +2353,7 @@ function oniTryCatch() {
   if (t.decoy) { oni.catchCd = 1; t.decoy.life = Math.min(t.decoy.life, 0.2); fxSparks(t.decoy.pos, 14, null, 3); showBig('ハズレ！', 900, { k: 'bad', s: 'それはデコイ（分身）だった' }); return; }
   const g = NET.ghosts.get(t.peer);
   const msg = { k: 'catch', id: race.id, by: NET.myPeer, to: t.peer, at: [S.pos.x, S.pos.y, S.pos.z], tp: [g.pos.x, g.pos.y, g.pos.z], t: r3(oniNow(), 10) };
-  NET.room.emit('oni', msg).catch(() => {});
+  oniEmit(msg);
 }
 // いちばん近い「つかまえられる相手」（デコイも含む）
 function oniCatchTarget() {
@@ -2422,7 +2424,7 @@ function oniUseAbility() {
   if (oni.cd > 0) { showBig(A.name + ' はまだ使えません', 700, { k: 'info', s: 'あと ' + Math.ceil(oni.cd) + ' 秒' }); return; }
   oni.cd = A.cd; oni.on = A.dur || 0; oni.onKey = k;
   const dir = aimDir(_d).clone(), me = NET.myPeer;
-  const send = (m) => { if (NET.room) NET.room.emit('oni', Object.assign({ id: race.id, from: me }, m)).catch(() => {}); };
+  const send = (m) => oniEmit(Object.assign({ id: race.id, from: me }, m));
   if (k === 'decoy') { const v = dir.clone().multiplyScalar(Math.max(7, S.tele.V)); send({ k: 'decoy', p: [S.pos.x, S.pos.y, S.pos.z], v: [v.x, v.y, v.z], q: [S.q.x, S.q.y, S.q.z, S.q.w] }); showBig('デコイ', 900, { k: 'info', s: '分身をまっすぐ飛ばした' }); }
   else if (k === 'stealth') { send({ k: 'stealth', d: A.dur }); showBig('ステルス', 900, { k: 'info', s: '3秒間ほぼ見えなくなる' }); }
   else if (k === 'blink') {
@@ -2694,7 +2696,7 @@ function oniResultPanel() {
     const c = caughtOf(p.peer);
     const st = p.peer === oni.firstOni ? '最初の鬼' : c ? fmtTime(c.t) + ' に ' + peerLabel(c.by) + ' が捕獲' : '逃げ切り！';
     const td = (cls, txt) => { const d = document.createElement('td'); if (cls) d.className = cls; d.textContent = txt; tr.appendChild(d); return d; };
-    const nd = td('', ''); const dot = document.createElement('i'); dot.className = 'dot'; dot.style.background = ONI.ROLE_COL[!c && p.peer !== oni.firstOni ? 'run' : 'oni']; nd.appendChild(dot); nd.appendChild(document.createTextNode(peerLabel(p.peer) + (p.me ? '（あなた）' : '')));
+    const nd = td('', ''); const dot = document.createElement('i'); dot.className = 'dot'; dot.style.background = ONI.ROLE_COL[!c && p.peer !== oni.firstOni ? 'run' : 'oni']; nd.appendChild(dot); nd.appendChild(document.createTextNode(peerLabel(p.peer) + (p.me && NET.nick ? '（あなた）' : '')));
     td('t', st); td('t', catchesOf(p.peer) ? '捕獲 ' + catchesOf(p.peer) : '');
     tb.appendChild(tr);
   });
@@ -2754,6 +2756,227 @@ function renderOniMenu() {
 }
 renderOniMenu();
 
+// ---------- ボット（ひとりでも遊べる）----------
+// ボットはこの画面の中だけで動く。ほかの人には見えず、通信にも乗らない。
+// 部屋の参加者一覧（room.peers）にボットを混ぜることで、ゴースト表示・役割・捕獲・リザルトの仕組みをそのまま使う。
+const BOT = {
+  on: false, list: [], n: 3, lv: 'normal', slowUntil: 0, logSeen: 0, meStealthUntil: 0,
+  LV: {
+    easy: { name: 'よわい', spd: 0.7, det: 30, react: 0.6 },
+    normal: { name: 'ふつう', spd: 0.85, det: 55, react: 0.3 },
+    hard: { name: 'つよい', spd: 1.0, det: 999, react: 0.12 },
+  },
+  NAMES: ['ボット・アオ', 'ボット・ミドリ', 'ボット・キイロ', 'ボット・モモ', 'ボット・シロ'],
+};
+try { const n = parseInt(localStorage.getItem('oni-bot-n'), 10); if (n >= 1 && n <= 5) BOT.n = n; const l = localStorage.getItem('oni-bot-lv'); if (BOT.LV[l]) BOT.lv = l; } catch (e) {}
+const _bv = new THREE.Vector3(), _bd = new THREE.Vector3(), _bq = new THREE.Vector3();
+
+// 通信の代わりに、この画面の中で合図を処理する
+function oniEmit(msg) {
+  if (BOT.on) {
+    if (msg.k === 'catch') oniOnCatch(msg, true);
+    else { msg.from = msg.from || NET.myPeer; oniOnAbility(msg); }
+    if (msg.k === 'slow') BOT.slowUntil = performance.now() + (msg.d || 5) * 1000;
+    if (msg.k === 'stealth') BOT.meStealthUntil = performance.now() + (msg.d || 3) * 1000;
+    return;
+  }
+  if (NET.room) NET.room.emit('oni', msg).catch(() => {});
+}
+// ほかの人に送る自分の情報（ボットと遊んでいる間は、ラウンド中だと思われないようにする）
+function netPresence() {
+  const o = myPresence();
+  if (BOT.on) { o.rc = null; o.tm = null; o.rd = false; }
+  return o;
+}
+// 通信できないときの代わりの部屋（ボットだけで遊ぶ用）
+function botEnsureRoom() {
+  if (!NET.room) {
+    const self = { peer: 'me', by: null, isMe: true, sameTab: true, kind: 'viewer', guest: false, presence: {} };
+    NET.room = { room: 'local', presence: () => Promise.resolve(), peers: () => [self], on: () => () => {}, emit: () => Promise.resolve(), onPeers: () => () => {}, connected: () => false, onConnection: () => () => {} };
+  }
+  const room = NET.room;
+  if (!room.__bot) {
+    const real = room.peers.bind(room);
+    room.peers = () => {
+      const list = real();
+      if (!BOT.on) return list;
+      const now = Date.now();
+      return Object.freeze(list.filter((p) => p.sameTab).concat(BOT.list.map((b) => ({ peer: b.id, by: null, isMe: false, sameTab: false, kind: 'viewer', guest: false, presence: b.pr, updatedAt: now }))));
+    };
+    room.__bot = true;
+  }
+  if (!NET.myPeer) for (const p of room.peers()) if (p.sameTab) NET.myPeer = p.peer;
+}
+function botPresence(b) {
+  b.pr = { m: mapId, st: 'fly', nk: b.name, rd: false,
+    p: [r3(b.pos.x, 100), r3(b.pos.y, 100), r3(b.pos.z, 100)], v: [r3(b.vel.x, 100), r3(b.vel.y, 100), r3(b.vel.z, 100)],
+    q: [b.q.x, b.q.y, b.q.z, b.q.w], tm: roleOf(b.id),
+    rc: race.state === 'off' ? null : { id: race.id, s: race.state, k: 0, f: null, a: Math.round(Math.max(0, oniNow())) } };
+}
+function botSpawn(b) {
+  const r = roleOf(b.id);
+  let p;
+  if (r === 'oni') p = ONI.ONI_SPAWN;
+  else {
+    const runners = [...oni.roles.entries()].filter(([, x]) => x === 'run').map(([id]) => id).sort();
+    p = ONI.RUN_SPAWN[Math.max(0, runners.indexOf(b.id)) % ONI.RUN_SPAWN.length];
+  }
+  b.pos.set(p[0], p[1], p[2]); b.vel.set(0, 0, 0); b.wp = null; b.replan = 0; b.inRange = 0; b.freezeUntil = 0;
+  b.yaw = yawTo(p, [-2, -3, 15]); b.q.setFromEuler(new THREE.Euler(0, b.yaw, 0, 'YXZ'));
+  botPresence(b);
+}
+// ボットと始める
+function startBotGame() {
+  if (!grid || loading) return;
+  botEnsureRoom();
+  BOT.on = true; BOT.slowUntil = 0; BOT.meStealthUntil = 0;
+  BOT.list = [];
+  for (let i = 0; i < BOT.n; i++) BOT.list.push({ id: 'bot' + (i + 1), name: BOT.NAMES[i], pos: new THREE.Vector3(), vel: new THREE.Vector3(), q: new THREE.Quaternion(), dir: new THREE.Vector3(0, 0, -1), yaw: 0, pr: null });
+  const all = [NET.myPeer].concat(BOT.list.map((b) => b.id));
+  const id = Math.floor(Math.random() * 1e9);
+  setReady(false);
+  oniOnRaceMsg({ m: mapId, id, oni: all[Math.floor(Math.random() * all.length)], ps: all, col: 'bump' });
+  BOT.logSeen = 0;
+  for (const b of BOT.list) botSpawn(b);
+  startRaceLocal(id);
+  lockMouse();
+}
+function botStop() {
+  BOT.on = false; BOT.list = [];
+  if (race.state !== 'off') { race.state = 'off'; oni.active = false; oni.role = null; tintMine(); }
+}
+// 候補の方向に進めるか（少し先まで壁がなく、飛べる範囲の中か）
+function botFree(pos, dir) {
+  for (const s of [1.2, 2.6, 4.2]) {
+    _bq.copy(pos).addScaledVector(dir, s);
+    if (_bq.y < MAP.groundY + 0.7 || _bq.y > ONI_CEIL - 1) return false;
+    if (!inPoly(_bq.x, _bq.z)) return false;
+    if (clearance(grid, _bq.x, _bq.y, _bq.z, 0.7) < 0.55) return false;
+  }
+  return true;
+}
+const BOT_DIRS = (() => { const out = []; for (const pitch of [0, -0.3, 0.35, 0.8, -0.6]) for (let i = 0; i < 16; i++) { const a = i / 16 * Math.PI * 2; out.push(new THREE.Vector3(Math.sin(a) * Math.cos(pitch), Math.sin(pitch), Math.cos(a) * Math.cos(pitch))); } return out; })();
+function botWander(b) {
+  if (!b.wp || b.wp.distanceTo(b.pos) < 4) {
+    for (let k = 0; k < 20; k++) {
+      const x = -45 + Math.random() * 85, z = -55 + Math.random() * 115, y = -4.5 + Math.random() * 9;
+      if (inPoly(x, z) && clearance(grid, x, y, z, 1.2) > 1.0) { b.wp = new THREE.Vector3(x, y, z); break; }
+    }
+    if (!b.wp) b.wp = new THREE.Vector3(0, -2, 26);
+  }
+  return _bd.copy(b.wp).sub(b.pos);
+}
+function botFrame(dt) {
+  if (!BOT.on) return;
+  if (res.on) { const rb = $('res-ready'); rb.hidden = false; rb.setAttribute('aria-pressed', 'false'); rb.textContent = 'もう一回（ボットと）'; $('res-stat').textContent = 'ボットと対戦中。「閉じて自由に飛ぶ」でボットと別れます。'; }
+  if ((race.state === 'done' && !res.on) || race.state === 'off') { botStop(); return; }
+  const now = performance.now(), L = BOT.LV[BOT.lv] || BOT.LV.normal, running = race.state === 'running';
+  // 捕獲の演出中は、関わった2人を止める
+  while (BOT.logSeen < oni.log.length) {
+    const l = oni.log[BOT.logSeen++];
+    for (const b of BOT.list) if (b.id === l.by || b.id === l.to) { b.freezeUntil = now + ONI.ACT * 1000; b.vel.set(0, 0, 0); b.inRange = 0; }
+  }
+  // 参加者（自分＋ボット）の位置と役割
+  const ents = [{ id: NET.myPeer, pos: S.pos, me: true }].concat(BOT.list.map((b) => ({ id: b.id, pos: b.pos, bot: b })));
+  for (const b of BOT.list) {
+    const role = roleOf(b.id);
+    const frozen = !running || now < b.freezeUntil || (role === 'oni' && b.id === oni.firstOni && oniNow() < ONI.HEAD);
+    if (frozen) { b.vel.multiplyScalar(Math.exp(-dt * 6)); botPresence(b); continue; }
+    let spd = P.maxSpeed * L.spd;
+    if (role === 'oni') spd *= oniCount() === 1 ? 1.15 : 1.08;
+    if (role === 'run' && now < BOT.slowUntil) spd *= 0.8;
+    // 行きたい方向
+    let want = null, target = null;
+    if (role === 'oni') {
+      let bd = L.det;
+      for (const e of ents) {
+        if (e.id === b.id || roleOf(e.id) !== 'run') continue;
+        if (e.me && (oni.act || now < BOT.meStealthUntil)) continue;
+        const d = e.pos.distanceTo(b.pos); if (d < bd) { bd = d; target = e; }
+      }
+      // 自分が出したデコイにだまされることもある
+      for (const dc of oni.decoys) { if (dc.owner === b.id || roleOf(dc.owner) !== 'run') continue; const d = dc.pos.distanceTo(b.pos); if (d < bd) { bd = d; target = { decoy: dc, pos: dc.pos }; } }
+      if (target) want = _bd.copy(target.pos).sub(b.pos);
+    } else {
+      _bd.set(0, 0, 0); let threat = false;
+      for (const e of ents) {
+        if (e.id === b.id || roleOf(e.id) !== 'oni') continue;
+        _bv.copy(b.pos).sub(e.pos); const d = Math.max(1, _bv.length());
+        if (d < 32) { _bd.addScaledVector(_bv.normalize(), 1 / (d * d)); threat = true; }
+      }
+      if (threat) { want = _bd; spd *= 1.0; } else spd *= 0.6;          // 鬼がいないときはゆっくり見回る
+    }
+    if (!want || want.lengthSq() < 1e-6) want = botWander(b);
+    const goal = _bv.copy(want).normalize();
+    // 進める方向の中で、行きたい方向にいちばん近いものを選ぶ（0.2秒ごと）
+    b.replan -= dt;
+    if (b.replan <= 0) {
+      b.replan = 0.2;
+      let best = null, bs = -9;
+      for (const d of BOT_DIRS) { const sc = d.dot(goal) + d.dot(b.dir) * 0.25; if (sc > bs && botFree(b.pos, d)) { bs = sc; best = d; } }
+      if (best) b.dir.copy(best); else b.dir.set(0, 1, 0);
+    }
+    b.vel.lerp(_bq.copy(b.dir).multiplyScalar(spd), 1 - Math.exp(-dt * 3));
+    _bq.copy(b.pos); b.pos.addScaledVector(b.vel, dt);
+    if (clearance(grid, b.pos.x, b.pos.y, b.pos.z, 0.5) < 0.32) { b.pos.copy(_bq); b.vel.multiplyScalar(-0.3); b.replan = 0; }
+    if (b.pos.y < MAP.groundY + 0.4) b.pos.y = MAP.groundY + 0.4;
+    oniClamp(b.pos, b.vel);
+    // 敵どうしでぶつかったら弾かれる（バンプ）
+    const myRole = oni.role;
+    if (myRole && role !== myRole) { _bv.copy(b.pos).sub(S.pos); const d = _bv.length(); if (d < 0.6 && d > 1e-4) b.pos.addScaledVector(_bv.normalize(), 0.6 - d); }
+    // 向き
+    if (b.vel.lengthSq() > 0.04) b.yaw = Math.atan2(-b.vel.x, -b.vel.z);
+    const tilt = -Math.min(1, b.vel.length() / 12) * 0.3;
+    b.q.setFromEuler(new THREE.Euler(tilt, b.yaw, 0, 'YXZ'));
+    // つかまえる
+    if (role === 'oni' && target) {
+      const d = target.pos.distanceTo(b.pos);
+      if (d <= ONI.RANGE * 0.85) {
+        b.inRange = (b.inRange || 0) + dt;
+        if (b.inRange >= L.react) {
+          b.inRange = 0;
+          if (target.decoy) { target.decoy.life = Math.min(target.decoy.life, 0.2); fxSparks(target.decoy.pos, 14, null, 3); }
+          else oniOnCatch({ k: 'catch', id: race.id, by: b.id, to: target.id, at: [b.pos.x, b.pos.y, b.pos.z], tp: [target.pos.x, target.pos.y, target.pos.z], t: r3(oniNow(), 10) }, false);
+        }
+      } else b.inRange = 0;
+    }
+    botPresence(b);
+  }
+}
+// メニュー: ひとりで遊ぶ
+function renderBotMenu() {
+  let box = document.getElementById('botbox');
+  if (!box) {
+    box = document.createElement('div'); box.className = 'msec'; box.id = 'botbox';
+    box.innerHTML = '<h2>ひとりで遊ぶ<small>ボットと増え鬼</small></h2><p class="lab">ボットの人数</p><div class="modes" id="bot-n"></div><p class="lab">ボットの強さ</p><div class="modes" id="bot-lv"></div><div class="row"><button class="go" type="button" id="bot-go">ボットと始める</button></div>';
+    const ab = document.getElementById('ab-run'), sec = ab && ab.closest('.msec');
+    if (sec) sec.parentNode.insertBefore(box, sec); else document.querySelector('#overlay .card').appendChild(box);
+    $('bot-go').addEventListener('click', (e) => { e.currentTarget.blur(); started = true; startBotGame(); });
+  }
+  const hn = $('bot-n'); hn.innerHTML = '';
+  for (let n = 1; n <= 5; n++) {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = n + '人';
+    b.setAttribute('aria-pressed', String(BOT.n === n));
+    b.addEventListener('click', () => { BOT.n = n; try { localStorage.setItem('oni-bot-n', String(n)); } catch (e) {} renderBotMenu(); b.blur(); });
+    hn.appendChild(b);
+  }
+  const hl = $('bot-lv'); hl.innerHTML = '';
+  for (const [k, L] of Object.entries(BOT.LV)) {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = L.name;
+    b.setAttribute('aria-pressed', String(BOT.lv === k));
+    b.addEventListener('click', () => { BOT.lv = k; try { localStorage.setItem('oni-bot-lv', k); } catch (e) {} renderBotMenu(); b.blur(); });
+    hl.appendChild(b);
+  }
+  $('bot-go').disabled = !grid || loading;
+}
+renderBotMenu();
+setInterval(() => { const b = document.getElementById('bot-go'); if (b) b.disabled = !grid || loading; }, 1000);
+// リザルト画面: ボットと遊んでいるときは「もう一回」
+$('result').addEventListener('click', (e) => {
+  if (!BOT.on || !e.target.closest) return;
+  if (e.target.closest('#res-ready')) { e.stopPropagation(); e.preventDefault(); startBotGame(); }
+}, true);
+
 // 接続
 function attachRoom(room) {
   NET.room = room;
@@ -2762,6 +2985,7 @@ function attachRoom(room) {
     const d = msg.data || {};
     if (d.m !== mapId || typeof d.id !== 'number' || d.id === race.id) return;
     if (race.state === 'countdown' && performance.now() - race.startedAt < 2500) return;   // ほぼ同時に届いた2つ目の合図は無視
+    if (BOT.on) return;          // ボットと遊んでいる間は、ほかの人のラウンドに巻き込まれない
     oniOnRaceMsg(d); startRaceLocal(d.id);
   }, () => {});
   room.on('oni', (msg) => {
@@ -2805,7 +3029,7 @@ $('nick').addEventListener('input', (e) => { NET.nick = e.target.value.slice(0, 
 canvas.addEventListener('click', () => { $('clickhint').hidden = true; });
 document.addEventListener('pointerlockchange', () => { if (document.pointerLockElement) $('clickhint').hidden = true; });
 // タブが裏にあるときも、ときどき位置を送る
-setInterval(() => { if (NET.room && grid && document.hidden) NET.room.presence(myPresence()).catch(() => {}); }, 1000);
+setInterval(() => { if (NET.room && grid && document.hidden) NET.room.presence(netPresence()).catch(() => {}); }, 1000);
 initNet();
 
 course.prevPos.copy(S.pos);
@@ -2882,7 +3106,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261028-5';
+(() => { const B = 'oni-20261028-6';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
