@@ -872,7 +872,7 @@ const dataCache = {};
 
 // ドローン（最初に一度だけ）
 const droneReady = new Promise((res, rej) => loader.load('drone.json', res, undefined, rej)).then((dr) => {
-  droneModel = dr.scene; droneModel.rotation.y = Math.PI; droneModel.position.y = -0.047;
+  droneModel = dr.scene; droneModel.rotation.y = Math.PI; droneModel.scale.setScalar(1.5); droneModel.position.y = -0.047 * 1.5;     // 見た目を1.5倍に（当たり判定は同じ）
   plane.add(droneModel);
   droneModel.traverse((o) => { if (/^Rotor_/.test(o.name)) rotors.push(o); if (o.isMesh) o.castShadow = true; });
   for (const r of rotors) {
@@ -1953,12 +1953,12 @@ function ghostFor(peer) {
     }
   });
   const root = new THREE.Group(); root.add(obj);
-  const halo = new THREE.Mesh(new THREE.TorusGeometry(0.4, 0.035, 6, 40), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55, depthWrite: false, fog: false }));
+  const halo = new THREE.Mesh(new THREE.TorusGeometry(0.55, 0.04, 6, 40), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55, depthWrite: false, fog: false }));
   halo.rotation.x = Math.PI / 2; root.add(halo);
   const cv = document.createElement('canvas'); cv.width = 256; cv.height = 64;
   const tex = new THREE.CanvasTexture(cv); tex.encoding = THREE.sRGBEncoding;
   const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false, fog: false, sizeAttenuation: false }));
-  label.scale.set(0.34, 0.085, 1); label.position.y = 0.45; label.renderOrder = 4; root.add(label);
+  label.scale.set(0.34, 0.085, 1); label.position.y = 0.6; label.renderOrder = 4; root.add(label);
   scene.add(root);
   g = { root, obj, halo, label, cv, tex, text: '', color: '', pos: new THREE.Vector3(), q: new THREE.Quaternion(), last: null, recv: 0, init: false, rotors: [] };
   obj.traverse((o) => { if (/^Rotor_/.test(o.name)) g.rotors.push(o); });
@@ -2163,7 +2163,7 @@ function renderBoard() {
   const rows = list.map((e, i) => {
     const rc = e.pr.rc; let stat;
     if (inRace && rc && rc.id === race.id) stat = rc.f != null ? 'ゴール ' + fmtTime(rc.f) : rc.s === 'countdown' ? 'スタート待ち' : (isRandom() ? '回収 ' : 'リング ') + Math.min(rc.k, nR) + '/' + nR;
-    else stat = e.pr.st === 'fly' ? (isRandom() ? '回収 ' + (e.pr.n || 0) : 'リング ' + ((e.pr.n || 0) + 1)) + '/' + nR : e.pr.st === 'crash' ? '墜落' : e.pr.st === 'watch' ? '観戦中' : '休憩中';
+    else stat = e.pr.st === 'fly' ? '飛行中' : e.pr.st === 'crash' ? '墜落' : e.pr.st === 'watch' ? '観戦中' : '休憩中';
     if (oni.active && inRace && rc && rc.id === race.id) stat = oniStat(e) || stat;
     if (e.pr.rd === true) stat = (inRace ? '次も ' : '') + '準備OK ✓';
     const best = e.pr.best != null ? fmtTime(e.pr.best) : '--:--.-';
@@ -2882,7 +2882,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261028-4';
+(() => { const B = 'oni-20261028-5';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
