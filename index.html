@@ -2226,7 +2226,7 @@ function oniFrozen() {
 }
 function oniSpeedMul() {
   let m = boostHeld ? boost.MUL : 1;
-  if (oni.role === 'oni' && oniRunning()) m *= oniCount() === 1 ? 1.15 : 1.08;     // 鬼は少し速い（1人のときはさらに速い）
+  if (oni.role === 'oni' && oniRunning()) m *= oniCount() === 1 ? 1.07 : 1.03;     // 鬼はほんの少し速い（1人のときは少しだけ多め）
   if (oni.dash > 0) m *= 1.8;
   if (oni.slow > 0) m *= 0.8;
   return m === 1 ? 0 : m;
@@ -2883,7 +2883,7 @@ function botFrame(dt) {
     const frozen = !running || now < b.freezeUntil || (role === 'oni' && b.id === oni.firstOni && oniNow() < ONI.HEAD);
     if (frozen) { b.vel.multiplyScalar(Math.exp(-dt * 6)); botPresence(b); continue; }
     let spd = P.maxSpeed * L.spd;
-    if (role === 'oni') spd *= oniCount() === 1 ? 1.15 : 1.08;
+    if (role === 'oni') spd *= oniCount() === 1 ? 1.07 : 1.03;
     if (role === 'run' && now < BOT.slowUntil) spd *= 0.8;
     // 行きたい方向
     let want = null, target = null;
@@ -3106,7 +3106,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261028-6';
+(() => { const B = 'oni-20261028-7';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
