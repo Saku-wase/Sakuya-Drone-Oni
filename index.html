@@ -732,7 +732,7 @@ if (typeof module !== 'undefined') module.exports = { DRONE_PRESETS, DRONE_HANDL
 function makeMqttRoom(opts) {
   if (typeof mqtt === 'undefined') return null;
   const brokers = opts.brokers, base = 'claude-drone-oni/v1/' + opts.room;
-  const myId = Math.random().toString(36).slice(2, 12);
+  const myId = opts.id || Math.random().toString(36).slice(2, 12);
   let mine = Object.freeze({}), client = null, bi = 0, isConn = false, snap = null, lastSent = 0, sendTimer = null;
   const others = new Map();              // peer → { presence, updatedAt, heard }
   const handlers = {}, peerFns = [], connFns = [];
@@ -803,6 +803,97 @@ function makeMqttRoom(opts) {
     onPeers(fn) { peerFns.push(fn); return () => {}; },
     connected() { return isConn; },
     onConnection(fn) { connFns.push(fn); setTimeout(() => fn(isConn), 0); return () => {}; },
+  };
+}
+
+// Cloudflare の自前中継サーバー（部屋ごとの Durable Object）につなぐ。
+// makeMqttRoom と同じ使い方。最初の6秒でつながらなければ、公開の中継サーバー（MQTT）に切り替える。
+function makeCfRoom(opts) {
+  const myId = Math.random().toString(36).slice(2, 12);
+  const url = opts.relay.replace(/\/$/, '') + '/r/' + encodeURIComponent(opts.room) + '?id=' + myId;
+  let mine = Object.freeze({}), ws = null, isConn = false, everOpen = false, snap = null, lastSent = 0, sendTimer = null, fb = null, retry = 1000;
+  const others = new Map();
+  const handlers = {}, peerFns = [], connFns = [];
+  const TIMEOUT = 6000;
+  const meEntry = (now) => ({ peer: myId, by: null, isMe: true, sameTab: true, kind: 'viewer', guest: false, presence: mine, updatedAt: now });
+  function list() {
+    const now = Date.now(), out = [meEntry(now)];
+    for (const [id, o] of others) { if (now - o.heard > TIMEOUT) { others.delete(id); continue; } out.push({ peer: id, by: null, isMe: false, sameTab: false, kind: 'viewer', guest: false, presence: o.presence, updatedAt: o.updatedAt }); }
+    return Object.freeze(out);
+  }
+  function rebuild() { snap = list(); for (const f of peerFns) try { f({ peers: snap, joined: [], left: [], updated: [] }); } catch (e) {} }
+  function send() {
+    sendTimer = null; lastSent = Date.now();
+    if (ws && isConn) try { ws.send(JSON.stringify({ t: 'p', d: mine })); } catch (e) {}
+  }
+  function setConn(v) { if (isConn !== v) { isConn = v; connFns.forEach((f) => { try { f(v); } catch (e) {} }); } }
+  function connect() {
+    if (fb) return;
+    let s; try { s = new WebSocket(url); } catch (e) { setTimeout(connect, retry); return; }
+    ws = s;
+    s.onopen = () => { if (ws !== s) return; everOpen = true; retry = 1000; setConn(true); send(); };
+    s.onmessage = (ev) => {
+      if (ws !== s) return;
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (!m || typeof m !== 'object') return;
+      const now = Date.now();
+      if (m.t === 'all' && m.ps && typeof m.ps === 'object') {
+        for (const id in m.ps) if (id !== myId && m.ps[id] && typeof m.ps[id] === 'object') others.set(id, { presence: Object.freeze(m.ps[id]), updatedAt: now, heard: now });
+        snap = null;
+      } else if (m.t === 'p' && typeof m.id === 'string' && m.id !== myId && m.d && typeof m.d === 'object') {
+        const o = others.get(m.id) || { updatedAt: 0 };
+        o.presence = Object.freeze(m.d); o.updatedAt = now; o.heard = now; others.set(m.id, o); snap = null;
+      } else if (m.t === 'l' && typeof m.id === 'string') {
+        if (others.delete(m.id)) rebuild();
+      } else if (m.t === 'e' && typeof m.id === 'string' && typeof m.k === 'string' && m.id !== myId) {
+        (handlers[m.k] || []).forEach((f) => { try { f({ topic: m.k, data: m.d, peer: m.id, by: null, isMe: false, sameTab: false, kind: 'viewer', guest: false }); } catch (e) {} });
+      }
+    };
+    s.onclose = () => { if (ws !== s) return; ws = null; setConn(false); if (!fb) { setTimeout(connect, retry); retry = Math.min(8000, retry * 1.6); } };
+    s.onerror = () => {};
+  }
+  // 最初の6秒でつながらなければ、公開の中継サーバーに切り替える
+  setTimeout(() => {
+    if (everOpen || fb || typeof makeMqttRoom !== 'function') return;
+    fb = makeMqttRoom({ room: opts.room, brokers: opts.brokers, id: myId });
+    if (!fb) return;
+    try { if (ws) ws.close(); } catch (e) {} ws = null;
+    for (const k in handlers) for (const f of handlers[k]) fb.on(k, f);
+    for (const f of peerFns) fb.onPeers(f);
+    for (const f of connFns) fb.onConnection(f);
+    fb.presence(mine);
+    console.info('[net] 自前の中継サーバーにつながらないため、公開の中継サーバーを使います');
+  }, 6000);
+  connect();
+  setInterval(() => { if (fb) return; if (Date.now() - lastSent > 1000) send(); rebuild(); }, 1000);   // 生きていることを知らせる
+  window.addEventListener('pagehide', () => { try { if (ws) ws.close(); } catch (e) {} });
+  return {
+    room: opts.room,
+    get via() { return fb ? 'mqtt' : 'cf'; },
+    presence(patch) {
+      const m = Object.assign({}, mine); for (const k in patch) { if (patch[k] === null) delete m[k]; else m[k] = patch[k]; }
+      mine = Object.freeze(m); snap = null;
+      if (fb) return fb.presence(patch);
+      const wait = 66 - (Date.now() - lastSent);           // 1秒に15回まで
+      if (wait <= 0) send(); else if (!sendTimer) sendTimer = setTimeout(send, wait);
+      return Promise.resolve();
+    },
+    peers() { if (fb) return fb.peers(); if (!snap) snap = list(); return snap; },
+    on(topic, fn) {
+      (handlers[topic] = handlers[topic] || []).push(fn);
+      let off2 = fb ? fb.on(topic, fn) : null;
+      return () => { handlers[topic] = handlers[topic].filter((f) => f !== fn); if (off2) off2(); };
+    },
+    emit(topic, data) {
+      if (fb) return fb.emit(topic, data);
+      if (!ws || !isConn) return Promise.reject(Object.assign(new Error('not connected'), { code: 'upstream_error' }));
+      try { ws.send(JSON.stringify({ t: 'e', k: topic, d: data })); } catch (e) { return Promise.reject(e); }
+      (handlers[topic] || []).forEach((f) => { try { f({ topic, data, peer: myId, by: null, isMe: true, sameTab: true, kind: 'viewer', guest: false }); } catch (e) {} });
+      return Promise.resolve();
+    },
+    onPeers(fn) { peerFns.push(fn); if (fb) fb.onPeers(fn); return () => {}; },
+    connected() { return fb ? fb.connected() : isConn; },
+    onConnection(fn) { connFns.push(fn); if (fb) fb.onConnection(fn); else setTimeout(() => fn(isConn), 0); return () => {}; },
   };
 }
 
@@ -3131,9 +3222,10 @@ function attachRoom(room) {
 function initNet() {
   if (!window.claude || typeof window.claude.use !== 'function') {
     // Claude の外: 公開の中継サーバー経由（URL の ?room=名前 で部屋を分けられる）
-    let roomName = 'lobby', brokers = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
-    try { const q = new URLSearchParams(location.search); const r = (q.get('room') || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32); if (r) roomName = r; if (q.get('broker')) brokers = [q.get('broker')]; } catch (e) {}
-    const room = typeof makeMqttRoom === 'function' ? makeMqttRoom({ room: roomName, brokers }) : null;
+    // 自前の中継サーバー（Cloudflare）を使う。つながらないときは公開の中継サーバー（MQTT）に自動で切り替える
+    let roomName = 'lobby', brokers = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'], relay = "wss://drone-oni-relay.398ono.workers.dev";
+    try { const q = new URLSearchParams(location.search); const r = (q.get('room') || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32); if (r) roomName = r; if (q.get('broker')) { brokers = [q.get('broker')]; relay = ''; } if (q.get('relay')) relay = q.get('relay'); } catch (e) {}
+    const room = relay && typeof makeCfRoom === 'function' ? makeCfRoom({ room: roomName, brokers, relay }) : (typeof makeMqttRoom === 'function' ? makeMqttRoom({ room: roomName, brokers }) : null);
     if (!room) { $('netbox').hidden = true; return; }
     $('roominfo').hidden = false; $('roomname').textContent = roomName;
     room.onConnection((c) => { $('netstate').textContent = c ? '接続中' : '接続しています…'; });
@@ -3241,7 +3333,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261029-4';
+(() => { const B = 'oni-20261029-5';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
