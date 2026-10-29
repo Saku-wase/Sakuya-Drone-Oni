@@ -2415,7 +2415,7 @@ function oniOnRaceMsg(d) {
   for (const p of (Array.isArray(d.ps) ? d.ps : [])) if (typeof p === 'string') oni.roles.set(p, p === oni.firstOni ? 'oni' : 'run');
   if (NET.myPeer && !oni.roles.has(NET.myPeer)) oni.roles.set(NET.myPeer, NET.myPeer === oni.firstOni ? 'oni' : 'run');
   oni.role = oni.roles.get(NET.myPeer) || 'run';
-  oni.act = null; oni.log = []; oni.caughtAt = null; oni.catches = 0; oni.lastAlone = false; oni.catchCd = 0;
+  oni.act = null; oni.log = []; oni.pend = null; oni.myHist = []; oni.caughtAt = null; oni.catches = 0; oni.lastAlone = false; oni.catchCd = 0;
   oni.cd = 0; oni.on = 0; oni.dash = 0; oni.slow = 0; oni.stun = 0; oni.radarUntil = 0; oni.pingAt = 0; oni.xrayUntil = 0;
   for (const o of oni.decoys) scene.remove(o.obj); for (const o of oni.smokes) scene.remove(o.grp); for (const o of oni.traps) scene.remove(o.mesh);
   oni.decoys = []; oni.smokes = []; oni.traps = []; oni.stealthUntil = new Map();
@@ -2458,7 +2458,22 @@ function oniTryCatch() {
   if (t.decoy) { oni.catchCd = 1; t.decoy.life = Math.min(t.decoy.life, 0.2); fxSparks(t.decoy.pos, 14, null, 3); showBig('ハズレ！', 900, { k: 'bad', s: 'それはデコイ（分身）だった' }); return; }
   const g = NET.ghosts.get(t.peer);
   const msg = { k: 'catch', id: race.id, by: NET.myPeer, to: t.peer, at: [S.pos.x, S.pos.y, S.pos.z], tp: [g.pos.x, g.pos.y, g.pos.z], t: r3(oniNow(), 10) };
-  oniEmit(msg);
+  if (BOT.on) { oniEmit(msg); return; }
+  msg.k = 'catchReq'; oni.catchCd = 0.5;
+  oni.pend = { to: t.peer, at: performance.now() };
+  if (NET.room) NET.room.emit('oni', msg).catch(() => {});
+}
+// 捕まる側: 鬼の申請が本当に届く距離だったかを、自分の直前0.35秒の位置で確かめる
+function oniOnCatchReq(d) {
+  if (d.to !== NET.myPeer || d.id !== race.id || !oniRunning() || oni.ended) return;
+  if (oni.role !== 'run' || roleOf(d.by) !== 'oni' || !Array.isArray(d.at)) return;
+  const ax = +d.at[0], ay = +d.at[1], az = +d.at[2], now = performance.now();
+  let best = Math.hypot(S.pos.x - ax, S.pos.y - ay, S.pos.z - az);
+  for (const h of oni.myHist) if (now - h[0] <= 350) best = Math.min(best, Math.hypot(h[1] - ax, h[2] - ay, h[3] - az));
+  if (best > ONI.RANGE + 0.25) return;            // こちらの画面では届いていない → 捕まらない
+  const ok = { k: 'catch', id: race.id, by: d.by, to: NET.myPeer, at: d.at, tp: [S.pos.x, S.pos.y, S.pos.z], t: r3(oniNow(), 10), cf: 1 };
+  oniOnCatch(ok, true);                             // 自分の画面ではすぐ確定
+  if (NET.room) NET.room.emit('oni', ok).catch(() => {});
 }
 // いちばん近い「つかまえられる相手」（デコイも含む）
 function oniCatchTarget() {
@@ -2476,6 +2491,7 @@ function oniOnCatch(m, fromMe) {
   if (m.to === NET.myPeer) { oni.role = 'oni'; oni.caughtAt = oniNow(); } else oni.roles.set(m.to, 'oni');
   oni.roles.set(m.by, 'oni');
   if (m.by === NET.myPeer) oni.catches++;
+  if (oni.pend && oni.pend.to === m.to) oni.pend = null;
   oni.log.push({ t: typeof m.t === 'number' ? m.t : oniNow(), by: m.by, to: m.to });
   const mine = m.by === NET.myPeer || m.to === NET.myPeer;
   const byPos = m.by === NET.myPeer ? S.pos.clone() : (NET.ghosts.get(m.by) ? NET.ghosts.get(m.by).pos.clone() : new THREE.Vector3(...m.at));
@@ -2583,6 +2599,12 @@ function oniRemoveTrap(tid) { const i = oni.traps.findIndex((t) => t.tid === tid
 // ---- 毎フレーム ----
 const _op = new THREE.Vector3();
 function oniFrame(dt) {
+  // 自分の位置を0.5秒ぶん覚えておく（捕獲の判定用）
+  { const now = performance.now(); oni.myHist = oni.myHist || []; oni.myHist.push([now, S.pos.x, S.pos.y, S.pos.z]); while (oni.myHist.length && now - oni.myHist[0][0] > 500) oni.myHist.shift(); }
+  if (oni.pend && performance.now() - oni.pend.at > 1500) {
+    if (roleOf(oni.pend.to) === 'run' && oniRunning() && !oni.act) showBig('逃げられた', 800, { k: 'bad', s: '相手の画面ではまだ届いていなかった' });
+    oni.pend = null;
+  }
   if (S.crashed) { if (!oni.crashAt) oni.crashAt = performance.now(); } else oni.crashAt = 0;
   // 墜落したときの戻り先: 0.1秒ごとに、壁から少し離れていた位置を覚えておく（どの時間帯でも）
   if (started && !S.crashed && !oniPhasing() && grid && $('overlay').hidden && performance.now() - (oni.histT || 0) > 100) {
@@ -2676,7 +2698,10 @@ function oniCollide() {
 // ゴーストの見た目: 役割の色・ステルス・透視
 function oniGhost(g, pr, peer) {
   const r = roleOf(peer) || (pr && (pr.tm === 'oni' || pr.tm === 'run') ? pr.tm : null);
-  if (pr && (pr.tm === 'oni') && oni.roles.get(peer) === 'run' && oni.active) oni.roles.set(peer, 'oni');   // 合図を取りこぼしたときの保険
+  const same = pr && pr.rc && pr.rc.id === race.id && oni.active;
+  if (same && pr.tm === 'oni' && oni.roles.get(peer) === 'run') oni.roles.set(peer, 'oni');   // 合図を取りこぼしたときの保険
+  if (same && pr.tm === 'run' && oni.roles.get(peer) === 'oni' && peer !== oni.firstOni && !oni.log.some((l) => l.to === peer)) oni.roles.set(peer, 'run');
+  if (same && !oni.roles.has(peer) && (pr.tm === 'oni' || pr.tm === 'run')) oni.roles.set(peer, pr.tm);
   const stealth = (oni.stealthUntil.get(peer) || 0) > performance.now();
   const xray = oni.role === 'oni' && r === 'run' && oni.xrayUntil > performance.now();
   if (g.tm !== r) { g.tm = r; tintObj(g.obj, r); }
@@ -3090,13 +3115,14 @@ function attachRoom(room) {
   room.on('race', (msg) => {
     const d = msg.data || {};
     if (d.m !== mapId || typeof d.id !== 'number' || d.id === race.id) return;
-    if (race.state === 'countdown' && performance.now() - race.startedAt < 2500) return;   // ほぼ同時に届いた2つ目の合図は無視
+    if (race.state === 'countdown' && performance.now() - race.startedAt < 4000 && d.id > race.id) return;   // ほぼ同時に2つ出たら、番号の小さい方に全員そろえる
     if (BOT.on) return;          // ボットと遊んでいる間は、ほかの人のラウンドに巻き込まれない
     oniOnRaceMsg(d); startRaceLocal(d.id);
   }, () => {});
   room.on('oni', (msg) => {
     const d = msg.data || {}; if (typeof d.k !== 'string') return;
-    if (d.k === 'catch') { if (d.by !== msg.peer) return; oniOnCatch(d, msg.isMe); }
+    if (d.k === 'catchReq') { if (d.by !== msg.peer || msg.isMe) return; oniOnCatchReq(d); }
+    else if (d.k === 'catch') { if (d.to !== msg.peer || msg.isMe) return; oniOnCatch(d, false); }
     else { d.from = msg.peer; oniOnAbility(d); }
   }, () => {});
   room.onPeers(() => {}, () => { NET.room = null; $('players').hidden = true; $('netbox').hidden = true; });
@@ -3215,7 +3241,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261029-3';
+(() => { const B = 'oni-20261029-4';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
