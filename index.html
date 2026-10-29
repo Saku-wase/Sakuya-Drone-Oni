@@ -2305,13 +2305,106 @@ function oniClamp(p, vel) {
   const nx = (p.x - best[0]) / bd, nz = (p.z - best[1]) / bd;
   p.x = best[0] + nx * ONI_MARGIN; p.z = best[1] + nz * ONI_MARGIN;
   if (vel) { const vn = vel.x * nx + vel.z * nz; if (vn > 0) { vel.x -= nx * vn; vel.z -= nz * vn; } }
+  oniFreeSpot(p, -nx, -nz);
   return true;
+}
+// 押し戻した位置が壁や物に埋まっていたら（＝物理の押し出しと境界の押し戻しが引っぱり合ってスタックする）、
+// 内側や上へ少しずつずらして、壁から離れた場所を探す
+function oniFreeSpot(p, ix, iz) {
+  if (!grid) return;
+  const need = P.radius + 0.12;
+  if (clearance(grid, p.x, p.y, p.z, need + 0.3) >= need) return;
+  const x0 = p.x, y0 = p.y, z0 = p.z;
+  for (let s = 0.5; s <= 8; s += 0.5) {
+    for (const [dx, dy, dz] of [[ix * s, 0, iz * s], [0, Math.min(s, ONI_CEIL - y0), 0], [ix * s, Math.min(s, ONI_CEIL - y0), iz * s], [ix * s, -s * 0.5, iz * s]]) {
+      const x = x0 + dx, y = y0 + dy, z = z0 + dz;
+      if (y < MAP.groundY + P.radius) continue;
+      if (clearance(grid, x, y, z, need + 0.3) >= need) { p.set(x, y, z); return; }
+    }
+  }
 }
 function oniBound() {
   if (oniClamp(S.pos, S.vel) && performance.now() > oni.edgeMsg) { oni.edgeMsg = performance.now() + 2500; showBig('エリアの端', 900, { k: 'info', s: 'これ以上は進めません' }); }
+  // スタック検知: 壁に埋まっている／押しても1秒以上ほとんど動けない状態が続いたら、少し前の安全な位置へ
+  const now = performance.now(), dtw = Math.min(0.1, (now - (oni.wallLast || now)) / 1000); oni.wallLast = now;
+  if (!grid || oniPhasing() || S.crashed || oniFrozen()) { oni.wallT = 0; oni.wallRef = null; return; }
+  const c = clearance(grid, S.pos.x, S.pos.y, S.pos.z, P.radius + 0.2);
+  const buried = c < P.radius * 0.5;
+  if (!oni.wallRef) { oni.wallRef = S.pos.clone(); oni.wallRefT = now; }
+  let stuck = false;
+  if (now - oni.wallRefT > 2000) {
+    // 2秒間、壁から離れる向きに進もうとしているのに0.3mも動けていなければ引っかかっている
+    if (oni.wallRef.distanceTo(S.pos) < 0.3 && oni.wallPush > 1.6) stuck = true;
+    oni.wallRef.copy(S.pos); oni.wallRefT = now; oni.wallPush = 0;
+  }
+  if (c < P.radius + 0.08 && Math.abs(S.cruise || 0) > 0.05) {
+    // 触れている壁の向き（外向き）と、進もうとしている向き
+    let nx = 0, ny = 0, nz = 0;
+    queryContacts(grid, S.pos.x, S.pos.y, S.pos.z, P.radius + 0.08, (dx, dy, dz, d) => { if (d > 1e-6) { nx += dx / d; ny += dy / d; nz += dz / d; } });
+    const nl = Math.hypot(nx, ny, nz), ad = aimDir(_d), sg = S.cruise < 0 ? -1 : 1;
+    if (nl > 1e-6 && (ad.x * nx + ad.y * ny + ad.z * nz) * sg / nl > -0.2) oni.wallPush = (oni.wallPush || 0) + dtw;
+  }
+  oni.wallT = buried ? (oni.wallT || 0) + dtw : 0;
+  if (oni.wallT > 0.4 || stuck) {
+    let p = oniSafePos(); if (oniEnclosed(p)) p = oni.safe && !oniEnclosed(oni.safe) ? oni.safe.clone() : new THREE.Vector3(...oniSpawn().slice(0, 3)); oniFreeSpot(p, 0, 0);
+    S.pos.copy(p); S.vel.set(0, 0, 0); oni.wallT = 0; oni.wallRef = null;
+    showBig('引っかかりを解除', 900, { k: 'info', s: '少し前の位置に戻しました' });
+  }
 }
 // 透過中は壁をすり抜ける（終わったときに壁の中なら、出るまで続ける）
 function oniPhasing() { return oni.phase > 0 || oni.phaseStuck > 0; }
+function oniRayHit(G, ox, oy, oz, dx, dy, dz, maxD) {
+  const c = G.cell, seen = new Set(), T = G.tri, st = c * 0.25;
+  for (let s = 0; s <= maxD + st; s += st) {
+    const a = G.grid.get(G.key(Math.floor((ox + dx * s) / c), Math.floor((oy + dy * s) / c), Math.floor((oz + dz * s) / c)));
+    if (!a) continue;
+    for (const t of a) {
+      if (seen.has(t)) continue; seen.add(t);
+      const ax = T[t*9], ay = T[t*9+1], az = T[t*9+2];
+      const e1x = T[t*9+3]-ax, e1y = T[t*9+4]-ay, e1z = T[t*9+5]-az, e2x = T[t*9+6]-ax, e2y = T[t*9+7]-ay, e2z = T[t*9+8]-az;
+      const px = dy*e2z-dz*e2y, py = dz*e2x-dx*e2z, pz = dx*e2y-dy*e2x, det = e1x*px+e1y*py+e1z*pz;
+      if (Math.abs(det) < 1e-9) continue;
+      const inv = 1/det, tx = ox-ax, ty = oy-ay, tz = oz-az, u = (tx*px+ty*py+tz*pz)*inv; if (u < 0 || u > 1) continue;
+      const qx = ty*e1z-tz*e1y, qy = tz*e1x-tx*e1z, qz = tx*e1y-ty*e1x, v = (dx*qx+dy*qy+dz*qz)*inv; if (v < 0 || u + v > 1) continue;
+      const d = (e2x*qx+e2y*qy+e2z*qz)*inv; if (d > 0 && d < maxD) return true;
+    }
+  }
+  return false;
+}
+const ONI_RAYS = (() => { const o = [[0, 1, 0]]; for (let i = 0; i < 8; i++) { const a = i / 8 * Math.PI * 2; o.push([Math.sin(a), 0, Math.cos(a)]); } for (let i = 0; i < 4; i++) { const a = (i + 0.5) / 4 * Math.PI * 2; o.push([Math.sin(a) * 0.7071, 0.7071, Math.cos(a) * 0.7071]); } return o; })();
+// まず光線で「まわりが全部ふさがっているか」を調べ、ふさがっていれば小さな升目で外（空が見える所・町の外）まで抜けられるか探す
+const oniEnclMemo = new Map();
+function oniSky(x, y, z) { return !oniRayHit(grid, x, y, z, 0, 1, 0, 40); }
+function oniEnclosed(p) {
+  if (!grid) return false;
+  const mk = Math.round(p.x) + ',' + Math.round(p.y) + ',' + Math.round(p.z);
+  if (oniEnclMemo.has(mk)) return oniEnclMemo.get(mk);
+  let res = true;
+  for (const [dx, dy, dz] of ONI_RAYS) if (!oniRayHit(grid, p.x, p.y, p.z, dx, dy, dz, 30)) { res = false; break; }
+  if (res) {
+    // 0.6m の升目で広がっていき、空が見える所か町の外に出られれば「中ではない」
+    const h = 0.6, seen = new Set(['0,0,0']), q = [[0, 0, 0]];
+    const N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    for (let qi = 0; qi < q.length && qi < 3000; qi++) {
+      const [i, j, k] = q[qi], x = p.x + i * h, y = p.y + j * h, z = p.z + k * h;
+      if (qi % 4 === 0 && oniSky(x, y, z)) { res = false; break; }
+      if (!inPoly(x, z)) { res = false; break; }
+      for (const [a, b, c] of N) {
+        const key = (i + a) + ',' + (j + b) + ',' + (k + c); if (seen.has(key)) continue;
+        const nx = x + a * h, ny = y + b * h, nz = z + c * h;
+        if (ny < MAP.groundY + 0.25 || ny > ONI_CEIL) continue;
+        seen.add(key);
+        if (clearance(grid, nx, ny, nz, 0.3) < 0.26) continue;
+        if (oniRayHit(grid, x, y, z, a, b, c, h)) { seen.delete(key); continue; }   // 薄い壁をまたがない
+        q.push([i + a, j + b, k + c]);
+      }
+      if (qi === 2999) res = false;   // 広すぎる空間は「中」とは見なさない
+    }
+  }
+  if (oniEnclMemo.size > 20000) oniEnclMemo.clear();
+  oniEnclMemo.set(mk, res);
+  return res;
+}
 
 // ---- ラウンドの開始・終了 ----
 function oniOnRaceMsg(d) {
@@ -2441,7 +2534,7 @@ function oniUseAbility() {
   else if (k === 'stealth') { send({ k: 'stealth', d: A.dur }); showBig('ステルス', 900, { k: 'info', s: '3秒間ほぼ見えなくなる' }); }
   else if (k === 'blink') {
     // 壁があってもすり抜けて5m先へ。行き先が建物の中なら、少し先か手前の空いている所に出る
-    const from = S.pos.clone(), free = (q) => q.y > MAP.groundY + 0.3 && clearance(grid, q.x, q.y, q.z, 0.5) > 0.4;
+    const from = S.pos.clone(), free = (q) => q.y > MAP.groundY + 0.3 && clearance(grid, q.x, q.y, q.z, 0.8) > 0.6 && !oniEnclosed(q);
     let to = null;
     for (const s of [5, 5.5, 6, 6.5, 7, 7.5, 8, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1]) { const q = from.clone().addScaledVector(dir, s); oniClamp(q, null); if (free(q)) { to = q; break; } }
     if (to) { S.pos.copy(to); fxSparks(from, 12, null, 3); }
@@ -2524,15 +2617,15 @@ function oniFrame(dt) {
   oni.stun = Math.max(0, oni.stun - dt); oni.catchCd = Math.max(0, oni.catchCd - dt);
   const wasPh = oni.phase > 0; oni.phase = Math.max(0, oni.phase - dt);
   if (oni.phase <= 0 && (wasPh || oni.phaseStuck > 0)) {
-    const inside = grid && clearance(grid, S.pos.x, S.pos.y, S.pos.z, 0.5) < 0.3;
-    if (inside) { oni.phaseStuck += dt; if (oni.phaseStuck > 2.5) { S.pos.copy(oniSafePos()); S.vel.set(0, 0, 0); oni.phaseStuck = 0; } }
+    const inside = grid && (clearance(grid, S.pos.x, S.pos.y, S.pos.z, 0.6) < P.radius + 0.1 || oniEnclosed(S.pos));
+    if (inside) { oni.phaseStuck += dt; if (oni.phaseStuck > 4) { S.pos.copy(oniSafePos()); S.vel.set(0, 0, 0); oni.phaseStuck = 0; } }
     else oni.phaseStuck = 0;
   }
   if (droneModel) droneModel.traverse((o) => { if (o.isMesh) { const ph = oniPhasing(); if (o.userData.ph !== ph) { o.userData.ph = ph; o.material.transparent = ph || !!o.userData.tr0; o.material.opacity = ph ? 0.35 : 1; } } });
   if (oniRunning()) {
     const tnow = oniNow();
     // 安全な場所を覚えておく（墜落したときの再スタート用）
-    oni.safeT -= dt; if (oni.safeT <= 0 && !S.crashed && grid && clearance(grid, S.pos.x, S.pos.y, S.pos.z, 1.2) > 0.9) { oni.safeT = 0.5; oni.safe = S.pos.clone(); }
+    oni.safeT -= dt; if (oni.safeT <= 0 && !S.crashed && !oniPhasing() && grid && clearance(grid, S.pos.x, S.pos.y, S.pos.z, 1.2) > 0.9) { oni.safeT = 0.5; oni.safe = S.pos.clone(); }
     // 全員の軌跡を記録（リザルト用）
     oni.trkT -= dt;
     if (oni.trkT <= 0) {
@@ -2567,6 +2660,7 @@ function oniCollide() {
     const d = _op.copy(S.pos).sub(g.pos), dist = d.length(); if (dist >= R || dist < 1e-4) continue;
     d.multiplyScalar(1 / dist);
     S.pos.addScaledVector(d, R - dist);
+    if (grid && clearance(grid, S.pos.x, S.pos.y, S.pos.z, P.radius + 0.2) < P.radius) S.pos.addScaledVector(d, -(R - dist));
     const vn = S.vel.dot(d); if (vn < 0) S.vel.addScaledVector(d, -vn * 1.6);
     S.vel.addScaledVector(d, 1.2);
     if ((oni.bumpCd.get(peer) || 0) > now) continue;
@@ -2932,7 +3026,7 @@ function botFrame(dt) {
     _bq.copy(b.pos); b.pos.addScaledVector(b.vel, dt);
     if (clearance(grid, b.pos.x, b.pos.y, b.pos.z, 0.5) < 0.32) { b.pos.copy(_bq); b.vel.multiplyScalar(-0.3); b.replan = 0; }
     if (b.pos.y < MAP.groundY + 0.4) b.pos.y = MAP.groundY + 0.4;
-    oniClamp(b.pos, b.vel);
+    if (oniClamp(b.pos, b.vel) && clearance(grid, b.pos.x, b.pos.y, b.pos.z, 0.5) < 0.32) { b.pos.copy(_bq); b.vel.set(0, 0, 0); b.replan = 0; }
     // 敵どうしでぶつかったら弾かれる（バンプ）
     const myRole = oni.role;
     if (myRole && role !== myRole) { _bv.copy(b.pos).sub(S.pos); const d = _bv.length(); if (d < 0.6 && d > 1e-4) b.pos.addScaledVector(_bv.normalize(), 0.6 - d); }
@@ -3121,7 +3215,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261028-8';
+(() => { const B = 'oni-20261029-1';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
