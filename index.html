@@ -811,7 +811,7 @@ function makeMqttRoom(opts) {
 function makeCfRoom(opts) {
   const myId = Math.random().toString(36).slice(2, 12);
   const url = opts.relay.replace(/\/$/, '') + '/r/' + encodeURIComponent(opts.room) + '?id=' + myId;
-  let mine = Object.freeze({}), ws = null, isConn = false, everOpen = false, snap = null, lastSent = 0, sendTimer = null, fb = null, retry = 1000;
+  let mine = Object.freeze({}), ws = null, isConn = false, everOpen = false, snap = null, lastSent = 0, sendTimer = null, fb = null, retry = 1000, closed = false, tick = null;
   const others = new Map();
   const handlers = {}, peerFns = [], connFns = [];
   const TIMEOUT = 6000;
@@ -828,7 +828,7 @@ function makeCfRoom(opts) {
   }
   function setConn(v) { if (isConn !== v) { isConn = v; connFns.forEach((f) => { try { f(v); } catch (e) {} }); } }
   function connect() {
-    if (fb) return;
+    if (fb || closed) return;
     let s; try { s = new WebSocket(url); } catch (e) { setTimeout(connect, retry); return; }
     ws = s;
     s.onopen = () => { if (ws !== s) return; everOpen = true; retry = 1000; setConn(true); send(); };
@@ -849,12 +849,12 @@ function makeCfRoom(opts) {
         (handlers[m.k] || []).forEach((f) => { try { f({ topic: m.k, data: m.d, peer: m.id, by: null, isMe: false, sameTab: false, kind: 'viewer', guest: false }); } catch (e) {} });
       }
     };
-    s.onclose = () => { if (ws !== s) return; ws = null; setConn(false); if (!fb) { setTimeout(connect, retry); retry = Math.min(8000, retry * 1.6); } };
+    s.onclose = () => { if (ws !== s) return; ws = null; setConn(false); if (!fb && !closed) { setTimeout(connect, retry); retry = Math.min(8000, retry * 1.6); } };
     s.onerror = () => {};
   }
   // 最初の6秒でつながらなければ、公開の中継サーバーに切り替える
   setTimeout(() => {
-    if (everOpen || fb || typeof makeMqttRoom !== 'function') return;
+    if (everOpen || fb || closed || typeof makeMqttRoom !== 'function') return;
     fb = makeMqttRoom({ room: opts.room, brokers: opts.brokers, id: myId });
     if (!fb) return;
     try { if (ws) ws.close(); } catch (e) {} ws = null;
@@ -865,10 +865,11 @@ function makeCfRoom(opts) {
     console.info('[net] 自前の中継サーバーにつながらないため、公開の中継サーバーを使います');
   }, 6000);
   connect();
-  setInterval(() => { if (fb) return; if (Date.now() - lastSent > 1000) send(); rebuild(); }, 1000);   // 生きていることを知らせる
+  tick = setInterval(() => { if (fb || closed) return; if (Date.now() - lastSent > 1000) send(); rebuild(); }, 1000);   // 生きていることを知らせる
   window.addEventListener('pagehide', () => { try { if (ws) ws.close(); } catch (e) {} });
   return {
     room: opts.room,
+    close() { closed = true; clearInterval(tick); clearTimeout(sendTimer); try { if (ws) ws.close(); } catch (e) {} ws = null; isConn = false; if (fb && typeof fb.close === 'function') fb.close(); },
     get via() { return fb ? 'mqtt' : 'cf'; },
     presence(patch) {
       const m = Object.assign({}, mine); for (const k in patch) { if (patch[k] === null) delete m[k]; else m[k] = patch[k]; }
@@ -903,8 +904,28 @@ function makeCfRoom(opts) {
 'use strict';
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+// ---------- 増え鬼のマップ（3種類）----------
+MAPS.ancient = {
+  name: '古代の町', tag: '神殿と劇場のある海辺の町', kind: 'mesh', mode: 'random', count: 10,
+  file: '/Sakuya-Drone-Oni/maps/ancient/ancient.json',
+  offset: [0, 0, 0], scale: 1, groundY: -0.81, bound: 160, lit: true, rings: [], pool: [],
+  start: [0, 20, 0], startYaw: 0,
+  sky: [0x4f9ad8, 0xd9e7ee], fog: [140, 420], sun: [-60, 90, 40], sunI: 1.8, hemi: 0.6, exposure: 0.95, groundColor: 0x2f7f93,
+  desc: '海に面した古代の町で増え鬼。神殿の回廊や円形劇場、畑のあいだを飛び回ろう。',
+  credit: '',
+};
+MAPS.bunker = {
+  name: '地下バンカー', tag: '通路と部屋が入り組んだ屋内', kind: 'mesh', mode: 'random', count: 10,
+  file: '/Sakuya-Drone-Oni/maps/bunker/bunker.json',
+  offset: [0, 0, 0], scale: 1, groundY: -13.8, bound: 110, lit: true, rings: [], pool: [],
+  start: [0, 0, 0], startYaw: 0,
+  sky: [0x1b2127, 0x1b2127], fog: [60, 160], sun: [20, 60, 30], sunI: 1.1, hemi: 1.0, exposure: 1.0, groundColor: 0x1b2127,
+  desc: '地下バンカーで増え鬼。狭い通路、階段、部屋がつながった屋内を逃げ回ろう。',
+  credit: '',
+};
+MAPS.desert.tag = '路地と屋根が入り組んだ町';
 let mapId = 'desert';
-try { const m = (location.hash || '').slice(1) || localStorage.getItem('drone3-map'); if (MAPS[m]) mapId = m; } catch (e) {}
+try { const m = (location.hash || '').slice(1) || localStorage.getItem('drone3-map'); if (MAPS[m] && ['desert', 'ancient', 'bunker'].includes(m)) mapId = m; } catch (e) {}
 let MAP = MAPS[mapId];
 
 // ---------- three.js ----------
@@ -1052,7 +1073,7 @@ function buildMeshMap(group, data) {
   for (const p of parts) {
     if (s !== 1) for (let i = 0; i < p.P.length; i++) p.P[i] *= s;
     const c = p.g.color, opt = { color: new THREE.Color(c[0], c[1], c[2]), side: THREE.DoubleSide };
-    if (p.g.tex) { const t = texLoader.load(p.g.tex); t.encoding = THREE.sRGBEncoding; t.flipY = false; t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4; opt.map = t; }
+    if (p.g.tex) { const t = texLoader.load(p.g.tex); t.encoding = THREE.sRGBEncoding; t.flipY = false; t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4; opt.map = t; if (/\.png$/.test(p.g.tex) && p.g.alpha && p.g.alpha !== 'OPAQUE') opt.alphaTest = 0.5; }
     const mat = MAP.unlit ? new THREE.MeshBasicMaterial(opt) : new THREE.MeshLambertMaterial(opt);
     // 頂点を三角形ごとに分けて、面ごとの法線を前もって計算する（光の計算を軽くし、角ばった見た目は保つ）
     const n = p.IDX.length / 3, pos = new Float32Array(n * 9), uv = p.UV ? new Float32Array(n * 6) : null;
@@ -1092,7 +1113,7 @@ function loadMap(id) {
     race.state = 'off'; $('big').hidden = true;
     resetCam(); syncAimToPlane();
     $('loading').hidden = true; $('go').disabled = false; $('go').textContent = started ? 'ニューゲーム' : '飛行を始める';
-    loading = false; renderMapUI();
+    loading = false; renderMapUI(); oniApplyMap(); if (title.on && title.panel === 'bot') renderTitleBot();
   }).catch((e) => { loading = false; $('loadmsg').textContent = '読み込みに失敗しました。ページを再読み込みしてください。（' + (e && e.message || e) + '）'; });
 }
 function makeFixedCams() {
@@ -1404,7 +1425,7 @@ function resume() { $('overlay').hidden = true; canvas.focus(); lockMouse(); }
 $('resume').addEventListener('click', resume);
 $('ring1').addEventListener('click', () => { restartAtCheckpoint(); lockMouse(); });
 window.addEventListener('keydown', (e) => {
-  if (e.code !== 'Escape') return;
+  if (e.code !== 'Escape' || title.on) return;
   e.preventDefault(); if (intro.on || performance.now() - intro.endedAt < 300) return;
   if ($('overlay').hidden) openMenu();
   else if (started && !S.crashed && performance.now() - menuOpenedAt > 350) resume();
@@ -1419,7 +1440,7 @@ const intro = { on: false, seen: false, t: 0, endedAt: -1e9 };
 const V3 = (x, y, z) => new THREE.Vector3(x, y, z);
 const ease = (t) => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 // 各カット: 長さ(秒)・見出し・カメラの位置と注視点（t=0〜1）
-const SHOTS = [
+let SHOTS = [
   { d: 3.2, no: 'OVERVIEW', ttl: '砂漠の町', sub: 'どこに隠れる？ どこから追い込む？',
     cam(t, p, l) { const a = 2.35 + t * 0.95, r = 120 - t * 18; p.set(-2 + Math.sin(a) * r, 62 - t * 14, 15 + Math.cos(a) * r); l.set(-2, -8, 15); } },
   { d: 1.8, no: 'STREET', ttl: 'メインストリート', sub: '建物のすき間を抜けて逃げろ',
@@ -1438,7 +1459,7 @@ const SHOTS = [
       l.copy(S.pos).lerp(lend, e * e);
     } },
 ];
-const INTRO_LEN = SHOTS.reduce((a, b) => a + b.d, 0);
+let INTRO_LEN = SHOTS.reduce((a, b) => a + b.d, 0);
 let introShot = -1;
 function startIntro() {
   intro.on = true; intro.seen = true; intro.t = 0; introShot = -1;
@@ -1447,6 +1468,8 @@ function startIntro() {
     : '操作：マウスで向き／W・S でスピード／左クリック（Space）でつかまえる／E でアビリティ／Shift でブースト／Q で後ろを確認';
   $('intro-skip').textContent = window.__isTouch ? 'タップでスキップ' : 'スキップ（Space / クリック）';
   $('intro').hidden = false; document.body.classList.add('intro');
+  if (oni.active && oni.role && !NET.spec) showAbPick(oni.role, 'start', INTRO_LEN + 2.5);
+  $('intro-ttl').textContent = MAP.name;
 }
 function endIntro() {
   if (!intro.on) return;
@@ -1877,7 +1900,7 @@ function frame(now) {
     const c = readInput(dt);
     acc += dt;
     while (acc >= DT) { stepDrone(S, P, H, c, DT, oniPhasing() ? null : grid, MAP.bound, MAP.groundY); acc -= DT; }
-    oniBound();
+    oniBound(); oniNavGuard();
     updateCourse();
     // リプレイ用に 0.05 秒ごとに位置と向きを記録
     if (race.state === 'running') {
@@ -1955,7 +1978,9 @@ function frame(now) {
     }
   }
   { let el = document.getElementById('backchip'); if (!el) { el = document.createElement('div'); el.id = 'backchip'; el.className = 'hud chip info'; el.textContent = '後ろを確認中'; el.style.cssText = 'top:calc(96px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%)'; document.body.appendChild(el); } el.hidden = !lookingBack; }
-  if (intro.on && introCamera(dt)) { if (droneModel) droneModel.visible = true; }
+  oniNav.step(title.on ? 10 : 4); abPickFrame();
+  if (title.on) { titleCamera(dt); if (droneModel) droneModel.visible = false; }
+  else if (intro.on && introCamera(dt)) { if (droneModel) droneModel.visible = true; }
   else if (res.on) { resultCamera(dt); if (droneModel) droneModel.visible = true; if (oni.resLines) oni.resLines.visible = res.ph === 3; }
   else if (oni.act && oniActCamera()) { if (droneModel) droneModel.visible = true; }
   else camera.fov += clamp((S.tele.V - 4) / 12, 0, 1) * H.speedFov;
@@ -2203,7 +2228,7 @@ function checkReady(list) {
   const n = list.length, ok = list.filter((e) => e.pr.rd === true).length;
   $('readystat').textContent = NET.raceActive ? 'ラウンド中です。終わったら、準備OKで次のラウンドを始められます（準備OK ' + ok + ' / ' + n + ' 人）' : '準備OK ' + ok + ' / ' + n + ' 人' + (n > 1 ? '　全員そろうと自動でスタートします' : '　2人以上で遊べます。リンクを共有して友達を呼ぼう');
   NET.lastList = list;
-  if (!grid || loading || n < 2 || ok < n || now < NET.lockUntil || NET.raceActive) { NET.allSince = 0; return; }
+  if (!grid || loading || n < 2 || ok < n || now < NET.lockUntil || NET.raceActive || (NET.mm && n < NET.mm.n && now - NET.mm.at < 25000)) { NET.allSince = 0; return; }
   if (!NET.allSince) NET.allSince = now;
   // 合図を送るのは1人だけ（番号の若い人から順に。送れなかったら次の人）
   const order = list.map((e) => e.peer || '').sort();
@@ -2354,11 +2379,11 @@ function peerLabel(peer) {
 }
 // 開始位置
 function oniSpawn() {
-  if (!oni.active || !oni.role) { const p = ONI.RUN_SPAWN[0]; return [p[0], p[1], p[2], yawTo(p, [-2, -3, 15])]; }
-  if (oni.role === 'oni') { const p = ONI.ONI_SPAWN; return [p[0], p[1], p[2], yawTo(p, [0, -3, 26])]; }
+  if (!oni.active || !oni.role) { const p = ONI.RUN_SPAWN[0]; return [p[0], p[1], p[2], yawTo(p, ONI_LOOK)]; }
+  if (oni.role === 'oni') { const p = ONI.ONI_SPAWN; return [p[0], p[1], p[2], yawTo(p, ONI_LOOK_ONI)]; }
   const runners = [...oni.roles.entries()].filter(([, r]) => r === 'run').map(([p]) => p).sort();
   const i = Math.max(0, runners.indexOf(NET.myPeer)), p = ONI.RUN_SPAWN[i % ONI.RUN_SPAWN.length];
-  return [p[0], p[1], p[2], yawTo(p, [-2, -3, 15])];
+  return [p[0], p[1], p[2], yawTo(p, ONI_LOOK)];
 }
 function yawTo(a, b) { const dx = b[0] - a[0], dz = b[2] - a[2]; return Math.atan2(-dx, -dz); }
 // 墜落したら、少し前にいた安全な場所から
@@ -2370,8 +2395,8 @@ function oniSafePos() {
   return oni.safe ? oni.safe.clone() : new THREE.Vector3(...oniSpawn().slice(0, 3));
 }
 // ---- 飛べる範囲: 町の外壁から3m外まで・高さの上限 ----
-const ONI_AREA = [[-40, -52], [-6, -60], [16, -63], [40, -60], [41, -20], [41, 65], [-22, 65], [-36, 49], [-47, 40], [-51, 10], [-47, -17], [-42, -40]];
-const ONI_CEIL = 20, ONI_MARGIN = 3;
+let ONI_AREA = [[-40, -52], [-6, -60], [16, -63], [40, -60], [41, -20], [41, 65], [-22, 65], [-36, 49], [-47, 40], [-51, 10], [-47, -17], [-42, -40]];
+let ONI_CEIL = 20; const ONI_MARGIN = 3;
 function inPoly(x, z) {
   let c = false;
   for (let i = 0, j = ONI_AREA.length - 1; i < ONI_AREA.length; j = i++) {
@@ -2468,6 +2493,7 @@ const oniEnclMemo = new Map();
 function oniSky(x, y, z) { return !oniRayHit(grid, x, y, z, 0, 1, 0, 40); }
 function oniEnclosed(p) {
   if (!grid) return false;
+  { const r = oniNav.reach(p.x, p.y, p.z); if (r !== null) return !r; if (ONI_MAPCFG[mapId] && ONI_MAPCFG[mapId].indoor) return false; }
   const mk = Math.round(p.x) + ',' + Math.round(p.y) + ',' + Math.round(p.z);
   if (oniEnclMemo.has(mk)) return oniEnclMemo.get(mk);
   let res = true;
@@ -2612,7 +2638,7 @@ function oniActStep(act, dt) {
   if (!act.flashed && t >= 1.3) {
     act.flashed = true; fxSparks(act.b, 34, null, 5);
     if (act.mine) { FX.shake = 0.18; flash(false); }
-    if (act.to === NET.myPeer) { tintMine(); showBig('つかまった！', 2000, { k: 'bad', s: 'ここからはあなたも鬼。逃げる人をつかまえよう' }); }
+    if (act.to === NET.myPeer) { tintMine(); showBig('つかまった！', 2000, { k: 'bad', s: 'ここからはあなたも鬼。逃げる人をつかまえよう' }); showAbPick('oni', 'caught', 6); }
     else if (act.by === NET.myPeer) showBig('つかまえた！', 1800, { k: 'ok', s: peerLabel(act.to) + ' も鬼になった（逃げる人 残り ' + runCount() + ' 人）' });
   }
   return t < ONI.ACT;
@@ -3044,7 +3070,7 @@ function botSpawn(b) {
     p = ONI.RUN_SPAWN[Math.max(0, runners.indexOf(b.id)) % ONI.RUN_SPAWN.length];
   }
   b.pos.set(p[0], p[1], p[2]); b.vel.set(0, 0, 0); b.wp = null; b.replan = 0; b.inRange = 0; b.freezeUntil = 0;
-  b.yaw = yawTo(p, [-2, -3, 15]); b.q.setFromEuler(new THREE.Euler(0, b.yaw, 0, 'YXZ'));
+  b.yaw = yawTo(p, ONI_LOOK); b.q.setFromEuler(new THREE.Euler(0, b.yaw, 0, 'YXZ'));
   botPresence(b);
 }
 // ボットと始める
@@ -3081,10 +3107,10 @@ const BOT_DIRS = (() => { const out = []; for (const pitch of [0, -0.3, 0.35, 0.
 function botWander(b) {
   if (!b.wp || b.wp.distanceTo(b.pos) < 4) {
     for (let k = 0; k < 20; k++) {
-      const x = -45 + Math.random() * 85, z = -55 + Math.random() * 115, y = -4.5 + Math.random() * 9;
-      if (inPoly(x, z) && clearance(grid, x, y, z, 1.2) > 1.0) { b.wp = new THREE.Vector3(x, y, z); break; }
+      const q = oniNav.random(); if (!q) break;
+      if (clearance(grid, q.x, q.y, q.z, 1.2) > 0.8) { b.wp = q; break; }
     }
-    if (!b.wp) b.wp = new THREE.Vector3(0, -2, 26);
+    if (!b.wp) b.wp = new THREE.Vector3(...ONI.RUN_SPAWN[0]);
   }
   return _bd.copy(b.wp).sub(b.pos);
 }
@@ -3254,10 +3280,473 @@ canvas.addEventListener('click', () => { $('clickhint').hidden = true; });
 document.addEventListener('pointerlockchange', () => { if (document.pointerLockElement) $('clickhint').hidden = true; });
 // タブが裏にあるときも、ときどき位置を送る
 setInterval(() => { if (NET.room && grid && document.hidden) NET.room.presence(netPresence()).catch(() => {}); }, 1000);
-initNet();
+// マップごとの増え鬼の設定（飛べる範囲・天井・出発位置・紹介カメラ）
+const ONI_MAPCFG = {};
+let ONI_LOOK = [-2, -3, 15], ONI_LOOK_ONI = [0, -3, 26];
+function oniApplyMap() {
+  const c = ONI_MAPCFG[mapId]; if (!c) return;
+  ONI_AREA = c.area; ONI_CEIL = c.ceil;
+  ONI.RUN_SPAWN = c.run; ONI.ONI_SPAWN = c.oni;
+  ONI_LOOK = c.look; ONI_LOOK_ONI = c.lookOni || c.look;
+  SHOTS = c.shots; INTRO_LEN = SHOTS.reduce((a, b) => a + b.d, 0);
+  oniNav.reset(c);
+  if (title.on) { title.t = 0; }
+}
+// 飛べる場所の地図（ボットの行き先・建物の中かどうかの判定に使う）
+const oniNav = {
+  h: 1.5, set: null, list: [], queue: null, done: false, cfg: null,
+  reset(c) { this.cfg = c; this.h = c.navH || 1.5; this.set = new Set(); this.list = []; this.queue = []; this.done = false; this.qi = 0;
+    if (c.navUrl) fetch(c.navUrl).then((r) => r.json()).then((d) => { if (this.cfg === c) this.loadBits(d); }).catch(() => {});
+    for (const p of c.seeds || [c.oni]) { const k = this.key(p[0], p[1], p[2]); if (!this.set.has(k)) { this.set.add(k); const v = this.cell(p[0], p[1], p[2]); this.queue.push(v); this.list.push(v); } } },
+  // あらかじめ計算しておいた「飛べる場所」を読み込む
+  loadBits(d) {
+    const raw = atob(d.b), n = d.n, o = d.o, set = new Set(), list = [];
+    for (let i = 0; i < raw.length; i++) { const byte = raw.charCodeAt(i); if (!byte) continue;
+      for (let bit = 0; bit < 8; bit++) if (byte & (1 << bit)) { const idx = i * 8 + bit, c = idx % n[2], b = Math.floor(idx / n[2]) % n[1], a = Math.floor(idx / (n[1] * n[2])); const v = [o[0] + a, o[1] + b, o[2] + c]; set.add(v[0] + ',' + v[1] + ',' + v[2]); list.push(v); } }
+    this.h = d.h; this.set = set; this.list = list; this.queue = null; this.done = true;
+  },
+  cell(x, y, z) { const h = this.h; return [Math.floor(x / h), Math.floor(y / h), Math.floor(z / h)]; },
+  key(x, y, z) { const v = this.cell(x, y, z); return v[0] + ',' + v[1] + ',' + v[2]; },
+  center(v) { const h = this.h; return [(v[0] + 0.5) * h, (v[1] + 0.5) * h, (v[2] + 0.5) * h]; },
+  step(budgetMs) {
+    if (this.done || !grid || !this.queue) return;
+    const t0 = performance.now(), h = this.h, N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    while (this.qi < this.queue.length && performance.now() - t0 < budgetMs) {
+      const v = this.queue[this.qi++], c = this.center(v);
+      for (const [a, b, d] of N) {
+        const w = [v[0] + a, v[1] + b, v[2] + d], k = w[0] + ',' + w[1] + ',' + w[2];
+        if (this.set.has(k)) continue;
+        const p = this.center(w);
+        if (p[1] < MAP.groundY + 0.4 || p[1] > ONI_CEIL || !inPoly(p[0], p[2])) continue;
+        if (clearance(grid, p[0], p[1], p[2], 0.6) < 0.45) continue;
+        if (oniRayHit(grid, c[0], c[1], c[2], a, b, d, h)) continue;
+        this.set.add(k); this.queue.push(w); this.list.push(w);
+      }
+    }
+    if (this.qi >= this.queue.length) { this.done = true; this.queue = null; }
+  },
+  // その位置が、出発地点からつながった空間か
+  reach(x, y, z) {
+    if (!this.done) return null;
+    const v = this.cell(x, y, z);
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let d = -1; d <= 1; d++) if (this.set.has((v[0] + a) + ',' + (v[1] + b) + ',' + (v[2] + d))) return true;
+    return false;
+  },
+  random() { if (!this.list.length) return null; const c = this.center(this.list[Math.floor(Math.random() * this.list.length)]); return new THREE.Vector3(c[0], c[1], c[2]); },
+};
+const START_SHOT = SHOTS[SHOTS.length - 1];
+ONI_MAPCFG.desert = {
+  area: ONI_AREA, ceil: 20, run: ONI.RUN_SPAWN, oni: ONI.ONI_SPAWN, look: [-2, -3, 15], lookOni: [0, -3, 26], shots: SHOTS,
+  seeds: [[0.5, -3, 45], [24, 5, -20], [0, 15, 0]], navH: 1.5,
+};
+ONI_MAPCFG.bunker = {
+  area: [[-25, -62], [71, -62], [71, 62], [-25, 62]], ceil: 13.6, indoor: true, navH: 1.5,
+  run: [[57.75, -3.75, 56.25], [5.25, -6.75, -50.25], [6.75, 2.25, 14.25], [59.25, -6.75, -15.75], [-17.25, -3.75, -14.25], [24.75, 2.25, -21.75], [57.75, -5.25, 20.25], [33.75, 5.25, 36.75]],
+  oni: [33.75, 2.25, 5.25], look: [33.75, 2.25, 5.25], lookOni: [33.75, 2.25, 40], seeds: [[45, 6, -9], [33.75, 2.25, 5.25]],
+  shots: [
+    { d: 3.0, no: 'OVERVIEW', ttl: '地下バンカー', sub: '部屋と通路が3つの階にまたがる屋内マップ',
+      cam(t, p, l) { const e = ease(t); p.set(57.75, -2.2, 58 - e * 18); l.set(57.75, -3, 20); } },
+    { d: 1.8, no: 'CORRIDOR', ttl: 'パイプの通路', sub: '曲がり角で追っ手をまけ',
+      cam(t, p, l) { const e = ease(t); p.set(33.75, 3.2, 4 + e * 16); l.set(33.75, 2, 40); } },
+    { d: 1.8, no: 'MACHINE', ttl: '機械室', sub: '柱や機械のかげに隠れられる',
+      cam(t, p, l) { const e = ease(t); p.set(22 + e * 10, 3.2, -21.75); l.set(48, 2, -21.75); } },
+    { d: 1.8, no: 'FARM', ttl: '水耕栽培室', sub: '細い通路は鬼も通りにくい',
+      cam(t, p, l) { const e = ease(t); p.set(0.75, -2.3, -24 - e * 12); l.set(0.75, -3, -52); } },
+    START_SHOT,
+  ],
+};
+ONI_MAPCFG.ancient = {
+  area: [[-49.6, -83.1], [5.8, -87.5], [46.7, -83.1], [56.9, -58.3], [53.1, -23.3], [58.3, 46.7], [52.5, 81.7], [29.2, 103.5], [-32.1, 112.3], [-61.2, 102.1], [-62.7, 64.2], [-54, 11.7], [-54, -43.7]],
+  ceil: 50, navH: 2,
+  run: [[-26, 22, 29], [10, 22, 30], [17, 18, 58], [-40, 21, 60], [40, 22, 40], [0, 22, 80], [-30, 34, -60], [30, 35, -60]],
+  oni: [10, 30, -35], look: [0, 22, 30], lookOni: [0, 22, 30],
+  seeds: [[0, 45, 0], [10, 30, -35], [-26, 22, 29]],
+  shots: [
+    { d: 3.2, no: 'OVERVIEW', ttl: '古代の町', sub: '神殿、大通り、円形劇場。どこに隠れる？',
+      cam(t, p, l) { const a = -0.2 + t * 0.9, r = 150 - t * 20; p.set(Math.sin(a) * r, 92 - t * 18, Math.cos(a) * r); l.set(0, 15, 0); } },
+    { d: 1.8, no: 'TEMPLE', ttl: '神殿の広場', sub: '回廊の柱のあいだを抜けて逃げろ',
+      cam(t, p, l) { const e = ease(t); p.set(10, 34 - e * 3, 18 - e * 22); l.set(10, 24, -60); } },
+    { d: 1.8, no: 'AVENUE', ttl: '大通り', sub: 'ブーストで一気に引き離せ',
+      cam(t, p, l) { const e = ease(t); p.set(-45 + e * 40, 24, 30); l.set(p.x + 30, 21, 30); } },
+    { d: 1.8, no: 'THEATER', ttl: '円形劇場', sub: '海側の崖ぎりぎりも飛べる',
+      cam(t, p, l) { const e = ease(t); p.set(44 - e * 6, 32 - e * 4, 84 - e * 6); l.set(17, 15, 58); } },
+    START_SHOT,
+  ],
+};
+
+ONI_MAPCFG.desert.navUrl = '/Sakuya-Drone-Oni/maps/desert/nav.json';
+ONI_MAPCFG.ancient.navUrl = '/Sakuya-Drone-Oni/maps/ancient/nav.json';
+ONI_MAPCFG.bunker.navUrl = '/Sakuya-Drone-Oni/maps/bunker/nav.json';
+// 飛べる場所の外（壁の向こうや建物の中）に出てしまったら、直前の位置に戻す
+const _navLast = new THREE.Vector3(); let _navHas = false;
+function oniNavGuard() {
+  if (!oniNav.done || oniPhasing() || S.crashed) { _navHas = false; return; }
+  const r = oniNav.reach(S.pos.x, S.pos.y, S.pos.z);
+  if (r) { _navLast.copy(S.pos); _navHas = true; }
+  else if (_navHas && S.pos.distanceTo(_navLast) < 3) { S.pos.copy(_navLast); S.vel.multiplyScalar(-0.2); }
+  else _navHas = false;
+}
+
+// ---------- タイトル画面・オンライン（マッチング）・設定・アビリティ選び ----------
+const ONI_RELAY = (() => { try { const q = new URLSearchParams(location.search); if (q.get('relay')) return q.get('relay'); if (q.get('broker')) return ''; } catch (e) {} return 'wss://drone-oni-relay.398ono.workers.dev'; })();
+const ONI_MAP_IDS = ['desert', 'ancient', 'bunker'];
+const MM_N = (() => { try { const n = parseInt(new URLSearchParams(location.search).get('mmn'), 10); if (n >= 2 && n <= 4) return n; } catch (e) {} return 4; })();
+const title = { on: true, t: 0, panel: 'main', mm: null };
+(function buildTitle() {
+  const css = document.createElement('style');
+  css.textContent = `
+#title{position:fixed;inset:0;z-index:40;display:flex;color:var(--ink);font-family:var(--f-body)}
+#title[hidden]{display:none}
+#title .tt-shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(6,12,18,.88) 0,rgba(6,12,18,.62) 34%,rgba(6,12,18,0) 62%);pointer-events:none}
+#title .tt-fade{position:absolute;inset:0;background:#05090d;opacity:1;pointer-events:none;transition:opacity .2s}
+#title .tt-col{position:relative;width:min(440px,100%);padding:clamp(28px,7vh,72px) clamp(20px,5vw,64px) 28px;display:flex;flex-direction:column;gap:28px;overflow-y:auto;max-height:100%;box-sizing:border-box}
+#title .tt-logo{display:flex;align-items:center;gap:16px}
+#title .tt-logo svg{width:96px;height:96px;flex:none;overflow:visible}
+#title .tt-logo .rotor{transform-box:fill-box;transform-origin:center;animation:ttspin 1.6s linear infinite}
+#title .tt-logo .rotor.r2,#title .tt-logo .rotor.r3{animation-direction:reverse}
+@keyframes ttspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){#title .tt-logo .rotor{animation:none}}
+#title .tt-word{font-family:'Dela Gothic One',var(--f-body);line-height:1.02;letter-spacing:.01em;white-space:nowrap}
+#title .tt-word small{display:block;font-size:17px;color:var(--accent);letter-spacing:.32em;margin-bottom:6px}
+#title .tt-word b{display:block;font-weight:400;font-size:clamp(40px,6.2vw,54px);color:#fff;text-shadow:0 3px 0 rgba(0,0,0,.35)}
+#title .tt-panel{display:flex;flex-direction:column;gap:2px}
+#title .tt-panel[hidden]{display:none}
+#title .tt-item{all:unset;box-sizing:border-box;cursor:pointer;display:block;padding:12px 16px 12px 18px;border-left:3px solid transparent;border-radius:0 6px 6px 0;transition:background .12s,border-color .12s}
+#title .tt-item b{display:block;font-size:22px;font-weight:700;letter-spacing:.04em}
+#title .tt-item span{display:block;font-size:13px;color:var(--ink-dim);margin-top:2px}
+#title .tt-item:hover,#title .tt-item:focus-visible{background:rgba(255,255,255,.07);border-left-color:var(--accent)}
+#title .tt-item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#title .tt-item.main b{font-size:26px}
+#title h3{margin:0 0 4px;font-size:20px;letter-spacing:.04em}
+#title .tt-lab{font-size:12px;color:var(--ink-dim);margin:14px 0 6px}
+#title .tt-opts{display:flex;flex-wrap:wrap;gap:6px}
+#title .tt-opts button{font:inherit;font-size:14px;color:var(--ink);background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:5px;padding:7px 12px;cursor:pointer}
+#title .tt-opts button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:rgba(255,200,87,.1)}
+#title .tt-opts button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#title .tt-maps{display:grid;gap:6px}
+#title .tt-maps button{text-align:left;padding:9px 12px}
+#title .tt-maps button small{display:block;font-size:12px;color:var(--ink-dim);margin-top:2px}
+#title .tt-row{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}
+#title .tt-go{font:inherit;font-weight:700;font-size:17px;cursor:pointer;border:0;border-radius:6px;padding:11px 22px;background:var(--accent);color:#1a1405}
+#title .tt-go:disabled{opacity:.5;cursor:default}
+#title .tt-back{font:inherit;font-size:15px;cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:10px 16px;background:transparent;color:var(--ink)}
+#title .tt-go:focus-visible,#title .tt-back:focus-visible{outline:2px solid #fff;outline-offset:2px}
+#title input[type=text]{background:rgba(0,0,0,.25);color:var(--ink);border:1px solid var(--line);border-radius:5px;padding:8px 10px;font:inherit;width:100%;box-sizing:border-box}
+#title input[type=range]{width:100%;accent-color:var(--accent)}
+#title .tt-seats{display:flex;gap:10px;margin:14px 0 6px}
+#title .tt-seats i{width:44px;height:44px;border-radius:50%;border:2px dashed rgba(255,255,255,.28);display:grid;place-items:center;font-style:normal;font-size:12px;color:var(--ink-dim)}
+#title .tt-seats i.on{border:2px solid var(--accent);background:rgba(255,200,87,.14);color:var(--accent)}
+#title .tt-stat{font-size:15px;margin:4px 0 0}
+#title .tt-note{font-size:12px;color:var(--ink-dim);margin:8px 0 0;line-height:1.6}
+#title .tt-err{color:var(--bad)}
+#title .tt-where{position:absolute;right:clamp(16px,3vw,32px);bottom:clamp(16px,3vh,28px);text-align:right;text-shadow:0 1px 3px rgba(0,0,0,.6)}
+#title .tt-where b{display:block;font-size:20px}
+#title .tt-where span{font-size:12px;color:rgba(255,255,255,.8)}
+#title .tt-foot{margin-top:auto;font-size:11px;color:var(--ink-dim)}
+body.titling .hud,body.titling #players,body.titling #board{visibility:hidden!important}
+#overlay .ab-hide,#overlay #netbox.tt-off,#overlay #botbox{display:none!important}
+#abpick{position:fixed;left:max(16px,env(safe-area-inset-left,0px));bottom:calc(7vh + 56px + env(safe-area-inset-bottom,0px));z-index:30;background:rgba(10,16,22,.9);border:1px solid var(--line);border-radius:10px;padding:12px 14px 14px;width:min(600px,calc(100vw - 32px));box-sizing:border-box;color:var(--ink);font-family:var(--f-body)}
+#abpick[hidden]{display:none}
+#abpick .ap-h{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin:0 2px 10px}
+#abpick .ap-h b{font-size:16px}
+#abpick .ap-h b.oni{color:var(--bad)}
+#abpick .ap-h b.run{color:#5ab8ff}
+#abpick .ap-h span{font-size:12px;color:var(--ink-dim)}
+#abpick .ap-list{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+#abpick button{font:inherit;color:var(--ink);background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:7px;padding:9px 10px;text-align:left;cursor:pointer;position:relative}
+#abpick button kbd{position:absolute;right:8px;top:8px;font-size:11px}
+#abpick button b{display:block;font-size:15px;margin-bottom:3px}
+#abpick button small{display:block;font-size:11px;color:var(--ink-dim);line-height:1.45}
+#abpick button[aria-pressed="true"]{border-color:var(--accent);background:rgba(255,200,87,.12)}
+#abpick button[aria-pressed="true"] b{color:var(--accent)}
+#abpick .ap-bar{height:3px;background:var(--line);border-radius:2px;margin-top:10px;overflow:hidden}
+#abpick .ap-bar i{display:block;height:100%;background:var(--accent);width:100%}
+@media (max-width:1100px){body.abpicking #intro-rules{display:none}}
+@media (max-width:620px){#abpick .ap-list{grid-template-columns:repeat(2,1fr)}#title .tt-shade{background:linear-gradient(180deg,rgba(6,12,18,.86),rgba(6,12,18,.55))}}
+`;
+  document.head.appendChild(css);
+  const lk = document.createElement('link'); lk.rel = 'stylesheet'; lk.href = 'https://fonts.googleapis.com/css2?family=Dela+Gothic+One&display=swap'; document.head.appendChild(lk);
+  const el = document.createElement('div'); el.id = 'title';
+  const rotor = (cx, cy, k) => `<g class="rotor r${k}" ><circle cx="${cx}" cy="${cy}" r="17" fill="none" stroke="rgba(255,255,255,.85)" stroke-width="3"/><path d="M${cx - 14} ${cy}h28M${cx} ${cy - 3}v6" stroke="#ffc857" stroke-width="3" stroke-linecap="round"/></g>`;
+  el.innerHTML = `
+  <div class="tt-shade"></div>
+  <div class="tt-col">
+    <div class="tt-logo" aria-label="ドローン鬼ごっこ">
+      <svg viewBox="0 0 96 96" aria-hidden="true">
+        <path d="M22 22L74 74M74 22L22 74" stroke="rgba(255,255,255,.85)" stroke-width="7" stroke-linecap="round"/>
+        ${rotor(20, 20, 1)}${rotor(76, 20, 2)}${rotor(20, 76, 3)}${rotor(76, 76, 4)}
+        <rect x="31" y="31" width="34" height="34" rx="7" fill="#ff4d4d" stroke="#fff" stroke-width="3"/>
+        <text x="48" y="58" text-anchor="middle" font-family="'Dela Gothic One',sans-serif" font-size="24" fill="#fff">鬼</text>
+      </svg>
+      <div class="tt-word"><small>ドローンで</small><b>鬼ごっこ</b></div>
+    </div>
+    <div class="tt-panel" data-p="main">
+      <button class="tt-item main" data-go="bot"><b>ボットと遊ぶ</b><span>ひとりで、ボットを相手に増え鬼</span></button>
+      <button class="tt-item main" data-go="online"><b>オンライン</b><span>4人そろったら自動で始まる</span></button>
+      <button class="tt-item" data-go="room" hidden><b>友だちの部屋に入る</b><span id="tt-roomname"></span></button>
+      <button class="tt-item" data-go="settings"><b>設定</b><span>名前・操作・カメラ・画質</span></button>
+    </div>
+    <div class="tt-panel" data-p="bot" hidden>
+      <h3>ボットと遊ぶ</h3>
+      <p class="tt-lab">マップ</p><div class="tt-opts tt-maps" id="tt-maps"></div>
+      <p class="tt-lab">ボットの人数</p><div class="tt-opts" id="tt-botn"></div>
+      <p class="tt-lab">ボットの強さ</p><div class="tt-opts" id="tt-botlv"></div>
+      <div class="tt-row"><button class="tt-go" id="tt-botgo" type="button">始める</button><button class="tt-back" data-go="main" type="button">もどる</button></div>
+    </div>
+    <div class="tt-panel" data-p="online" hidden>
+      <h3>オンライン</h3>
+      <p class="tt-lab">表示名</p><input type="text" id="tt-nick" maxlength="16" placeholder="名前を入力">
+      <div class="tt-seats" id="tt-seats"><i></i><i></i><i></i><i></i></div>
+      <p class="tt-stat" id="tt-mmstat">対戦相手を探しています…</p>
+      <p class="tt-note">4人そろうと、同じマップに集まってラウンドが始まります。マップはランダムで決まります。</p>
+      <div class="tt-row"><button class="tt-back" data-go="main" type="button">やめる</button><button class="tt-back" id="tt-mmbot" type="button">待たずにボットと遊ぶ</button></div>
+    </div>
+    <div class="tt-panel" data-p="settings" hidden>
+      <h3>設定</h3>
+      <p class="tt-lab">表示名（オンラインで表示）</p><input type="text" id="tt-nick2" maxlength="16" placeholder="名前を入力">
+      <p class="tt-lab">向きを変える感度 <b class="num" id="tt-sensv" style="color:var(--accent)"></b></p><input type="range" id="tt-sens" min="0.3" max="3" step="0.1">
+      <p class="tt-lab">カメラ</p><div class="tt-opts" id="tt-cam"></div>
+      <p class="tt-lab">動きの感じ</p><div id="tt-handling"></div>
+      <p class="tt-lab">画質</p><div class="tt-opts" id="tt-q"></div>
+      <div class="tt-row"><button class="tt-back" data-go="main" type="button">もどる</button></div>
+    </div>
+    <p class="tt-foot">マウスで向き、W/S でスピード、クリックでつかまえる、E でアビリティ</p>
+  </div>
+  <div class="tt-where" id="tt-where"><b></b><span></span></div>
+  <div class="tt-fade" id="tt-fade"></div>`;
+  document.body.appendChild(el);
+  const ap = document.createElement('div'); ap.id = 'abpick'; ap.hidden = true;
+  ap.innerHTML = '<div class="ap-h"><b id="ap-ttl"></b><span id="ap-hint"></span></div><div class="ap-list" id="ap-list"></div><div class="ap-bar"><i id="ap-bar"></i></div>';
+  document.body.appendChild(ap);
+})();
+
+// 画質
+const QUALITY = { low: { name: '軽量', pr: 0.75 }, mid: { name: '標準', pr: 1 }, high: { name: '高画質', pr: 1.5 } };
+let quality = 'mid';
+try { const q = localStorage.getItem('oni-quality'); if (QUALITY[q]) quality = q; } catch (e) {}
+function applyQuality() { renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, QUALITY[quality].pr)); resize(); }
+applyQuality();
+
+function titleShow(panel) {
+  title.on = true; $('title').hidden = false; document.body.classList.add('titling');
+  $('overlay').hidden = true; started = false; releaseLock(); keys.clear();
+  titlePanel(panel || 'main');
+}
+function titleHide() { title.on = false; $('title').hidden = true; document.body.classList.remove('titling'); if (title.panel === 'online') mmStop(); }
+function titlePanel(p) {
+  if (title.panel === 'online' && p !== 'online') mmStop();
+  title.panel = p;
+  document.querySelectorAll('#title .tt-panel').forEach((x) => { x.hidden = x.dataset.p !== p; });
+  if (p === 'bot') renderTitleBot();
+  if (p === 'settings') renderTitleSettings();
+  if (p === 'online') mmStart();
+  const f = document.querySelector('#title .tt-panel[data-p="' + p + '"] button, #title .tt-panel[data-p="' + p + '"] input'); if (f && !window.__isTouch) f.focus({ preventScroll: true });
+}
+document.getElementById('title').addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('[data-go]'); if (!b) return;
+  const g = b.dataset.go;
+  if (g === 'room') { titleHide(); netJoinUrlRoom(); return; }
+  titlePanel(g);
+});
+window.addEventListener('keydown', (e) => {
+  if (!title.on || e.code !== 'Escape') return;
+  if (title.panel !== 'main') { e.preventDefault(); e.stopImmediatePropagation(); titlePanel('main'); }
+}, true);
+
+// 背景: いまのマップの紹介カットをゆっくり流し続ける
+function titleCamera(dt) {
+  const shots = SHOTS.slice(0, -1), K = 2.6;
+  const tot = shots.reduce((a, b) => a + b.d * K, 0);
+  title.t = (title.t + dt) % tot;
+  let t = title.t, i = 0; while (i < shots.length - 1 && t >= shots[i].d * K) { t -= shots[i].d * K; i++; }
+  const sh = shots[i], d = sh.d * K;
+  sh.cam(Math.min(1, t / d), camera.position, look);
+  camera.up.set(0, 1, 0); camera.lookAt(look); camera.fov = 58;
+  const f = Math.min(1, t / 0.5, (d - t) / 0.5);
+  $('tt-fade').style.opacity = loading || !grid ? 1 : (1 - Math.max(0, f)).toFixed(3);
+  const w = $('tt-where');
+  if (w.dataset.k !== mapId + i) { w.dataset.k = mapId + i; w.firstChild.textContent = MAP.name; w.lastChild.textContent = sh.ttl === MAP.name ? (MAP.tag || '') : sh.ttl; }
+}
+
+// ボットと遊ぶ
+function renderTitleBot() {
+  const hm = $('tt-maps'); hm.innerHTML = '';
+  for (const id of ONI_MAP_IDS) {
+    const M = MAPS[id]; const b = document.createElement('button'); b.type = 'button';
+    b.innerHTML = M.name + '<small>' + (M.tag || '') + '</small>';
+    b.setAttribute('aria-pressed', String(id === mapId)); b.disabled = loading;
+    b.addEventListener('click', () => { if (id === mapId || loading) return; loadMap(id).then(renderTitleBot); renderTitleBot(); });
+    hm.appendChild(b);
+  }
+  const hn = $('tt-botn'); hn.innerHTML = '';
+  for (let n = 1; n <= 5; n++) {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = n + '体';
+    b.setAttribute('aria-pressed', String(BOT.n === n));
+    b.addEventListener('click', () => { BOT.n = n; try { localStorage.setItem('oni-bot-n', String(n)); } catch (e) {} renderTitleBot(); });
+    hn.appendChild(b);
+  }
+  const hl = $('tt-botlv'); hl.innerHTML = '';
+  for (const [k, L] of Object.entries(BOT.LV)) {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = L.name;
+    b.setAttribute('aria-pressed', String(BOT.lv === k));
+    b.addEventListener('click', () => { BOT.lv = k; try { localStorage.setItem('oni-bot-lv', k); } catch (e) {} renderTitleBot(); });
+    hl.appendChild(b);
+  }
+  $('tt-botgo').disabled = !grid || loading;
+}
+$('tt-botgo').addEventListener('click', () => { if (!grid || loading) return; titleStartBots(); });
+function titleStartBots() {
+  netLeave();
+  titleHide(); started = true; startBotGame();
+}
+
+// 設定
+function renderTitleSettings() {
+  $('tt-nick2').value = NET.nick || '';
+  const sv = window.__sens || 1; $('tt-sens').value = sv; $('tt-sensv').textContent = '×' + Number(sv).toFixed(1);
+  const hc = $('tt-cam'); hc.innerHTML = '';
+  CAM_NAMES.forEach((n, i) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = n; b.setAttribute('aria-pressed', String(camMode === i)); b.addEventListener('click', () => { setView(i); try { localStorage.setItem('oni-cam', String(i)); } catch (e) {} renderTitleSettings(); }); hc.appendChild(b); });
+  const hq = $('tt-q'); hq.innerHTML = '';
+  for (const [k, Q] of Object.entries(QUALITY)) { const b = document.createElement('button'); b.type = 'button'; b.textContent = Q.name; b.setAttribute('aria-pressed', String(quality === k)); b.addEventListener('click', () => { quality = k; try { localStorage.setItem('oni-quality', k); } catch (e) {} applyQuality(); renderTitleSettings(); }); hq.appendChild(b); }
+  const hp = $('hpresets'); if (hp && hp.parentNode !== $('tt-handling')) { hp.classList.add('tt-opts'); $('tt-handling').appendChild(hp); }
+}
+try { const c = parseInt(localStorage.getItem('oni-cam'), 10); if (c === 0 || c === 1) setView(c); } catch (e) {}
+const setNick = (v) => { NET.nick = v.slice(0, 16); $('nick').value = NET.nick; $('tt-nick').value = NET.nick; $('tt-nick2').value = NET.nick; try { localStorage.setItem('drone3-nick', NET.nick); } catch (err) {} if (NET.room) NET.room.presence({ nk: NET.nick || null }).catch(() => {}); };
+$('tt-nick').addEventListener('input', (e) => setNick(e.target.value));
+$('tt-nick2').addEventListener('input', (e) => setNick(e.target.value));
+$('tt-sens').addEventListener('input', (e) => { const x = parseFloat(e.target.value); const s = $('sens'); s.value = x; s.dispatchEvent(new Event('input')); $('tt-sensv').textContent = '×' + x.toFixed(1); });
+
+// ---------- オンライン: マッチング ----------
+function mmStart() {
+  mmStop();
+  $('tt-nick').value = NET.nick || '';
+  const seats = $('tt-seats').children; for (const s of seats) { s.className = ''; s.textContent = ''; }
+  const stat = $('tt-mmstat'); stat.className = 'tt-stat'; stat.textContent = '中継サーバーにつないでいます…';
+  if (!ONI_RELAY) { stat.textContent = 'この設定ではオンライン対戦を使えません。'; stat.classList.add('tt-err'); return; }
+  const id = Math.random().toString(36).slice(2, 12);
+  let ws; try { ws = new WebSocket(ONI_RELAY.replace(/\/$/, '') + '/mm?id=' + id + (MM_N !== 4 ? '&n=' + MM_N : '')); } catch (e) { stat.textContent = 'つなげませんでした。時間をおいて試してください。'; stat.classList.add('tt-err'); return; }
+  const mm = title.mm = { ws, id, n: 0 };
+  ws.onmessage = (ev) => {
+    if (title.mm !== mm) return;
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.t === 'q') {
+      mm.n = m.n;
+      for (let i = 0; i < seats.length; i++) { seats[i].className = i < m.n ? 'on' : ''; seats[i].textContent = i === 0 ? 'あなた' : ''; }
+      stat.textContent = '対戦相手を探しています（' + m.n + ' / ' + (m.need || 4) + ' 人）';
+    } else if (m.t === 'match' && typeof m.room === 'string') {
+      for (const s of seats) s.className = 'on';
+      stat.textContent = 'そろいました！ マップを準備しています…';
+      title.mm = null; try { ws.close(); } catch (e) {}
+      mmJoin(m);
+    }
+  };
+  ws.onclose = () => { if (title.mm === mm) { stat.textContent = '中継サーバーとの接続が切れました。もう一度「オンライン」を選んでください。'; stat.classList.add('tt-err'); title.mm = null; } };
+  ws.onerror = () => {};
+  mm.ping = setInterval(() => { try { ws.send('ping'); } catch (e) {} }, 20000);
+}
+function mmStop() { const mm = title.mm; title.mm = null; if (mm) { clearInterval(mm.ping); try { mm.ws.close(); } catch (e) {} } }
+$('tt-mmbot').addEventListener('click', () => { mmStop(); titlePanel('bot'); });
+function mmJoin(m) {
+  const map = MAPS[m.map] && ONI_MAP_IDS.includes(m.map) ? m.map : mapId;
+  const go = () => {
+    netLeave();
+    NET.mm = { room: m.room, n: Array.isArray(m.ids) ? m.ids.length : 4, at: performance.now() };
+    netJoin(m.room);
+    titleHide();
+    started = true; race.state = 'off'; reset();
+    showBig('マッチしました', 3000, { k: 'ok', s: '全員がそろうとラウンドが始まります' + (window.__isTouch ? '' : '（画面をクリックして操作）') });
+    setReady(true);
+  };
+  if (map !== mapId || !grid) loadMap(map).then(go); else go();
+}
+
+// 部屋に入る・出る
+function netJoin(roomName) {
+  const brokers = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+  let b2 = brokers; try { const q = new URLSearchParams(location.search); if (q.get('broker')) b2 = [q.get('broker')]; } catch (e) {}
+  const room = ONI_RELAY && typeof makeCfRoom === 'function' ? makeCfRoom({ room: roomName, brokers: b2, relay: ONI_RELAY }) : (typeof makeMqttRoom === 'function' ? makeMqttRoom({ room: roomName, brokers: b2 }) : null);
+  if (!room) return;
+  NET.myPeer = null;
+  $('roominfo').hidden = false; $('roomname').textContent = roomName;
+  room.onConnection((c) => { $('netstate').textContent = c ? '接続中' : '接続しています…'; });
+  attachRoom(room);
+  for (const p of room.peers()) if (p.sameTab) NET.myPeer = p.peer;
+  room.presence(netPresence()).catch(() => {});
+}
+function netLeave() {
+  if (BOT.on) botStop();
+  if (NET.room && typeof NET.room.close === 'function') { try { NET.room.close(); } catch (e) {} }
+  if (NET.room && NET.room.room !== 'local') { NET.room = null; NET.ghosts.forEach((g) => { if (g.root) scene.remove(g.root); else if (g.obj) scene.remove(g.obj); }); NET.ghosts.clear(); }
+  NET.mm = null; NET.ready = false;
+  if (race.state !== 'off') { race.state = 'off'; oni.active = false; oni.role = null; tintMine(); }
+  $('netbox').classList.add('tt-off');
+}
+const URL_ROOM = (() => { try { return (new URLSearchParams(location.search).get('room') || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32); } catch (e) { return ''; } })();
+if (URL_ROOM) { const b = document.querySelector('#title [data-go="room"]'); b.hidden = false; $('tt-roomname').textContent = '部屋「' + URL_ROOM + '」で、準備OKを押した人どうしで遊ぶ'; }
+function netJoinUrlRoom() {
+  netLeave(); netJoin(URL_ROOM);
+  $('netbox').classList.remove('tt-off'); $('netbox').hidden = false;
+  openMenuForce();
+}
+// ゲームから タイトルへ戻る
+function backToTitle() {
+  if (res.on) endResult();
+  endIntro(); netLeave(); $('big').hidden = true;
+  titleShow('main');
+}
+{
+  const row = $('resume').parentNode, b = document.createElement('button');
+  b.type = 'button'; b.className = 'go alt'; b.id = 'totitle'; b.textContent = 'タイトルに戻る';
+  b.addEventListener('click', backToTitle); row.appendChild(b);
+  $('go').style.display = 'none'; $('ring1').textContent = '少し前の位置からやり直す';
+  document.querySelectorAll('#ab-run, #ab-oni').forEach((x) => { const s = x.closest('.msec'); if (s) s.classList.add('ab-hide'); });
+  $('netbox').classList.add('tt-off');
+}
+
+// ---------- アビリティを選ぶ ----------
+const abp = { on: false, side: null, until: 0, dur: 0, why: '' };
+function showAbPick(side, why, secs) {
+  abp.on = true; abp.side = side; abp.why = why; abp.dur = secs; abp.until = performance.now() + secs * 1000;
+  $('abpick').hidden = false; document.body.classList.add('abpicking');
+  const t = $('ap-ttl'); t.className = side;
+  t.textContent = why === 'caught' ? '鬼になった！ 鬼のアビリティを選ぶ' : (side === 'oni' ? 'あなたは鬼。アビリティを選ぶ' : '逃げる側。アビリティを選ぶ');
+  $('ap-hint').textContent = window.__isTouch ? 'タップで選ぶ' : '1〜4 キーかクリックで選ぶ';
+  renderAbPick();
+}
+function renderAbPick() {
+  const host = $('ap-list'); host.innerHTML = ''; let i = 0;
+  for (const [k, A] of Object.entries(ONI.ABIL)) {
+    if (A.side !== abp.side) continue; i++;
+    const b = document.createElement('button'); b.type = 'button'; b.dataset.k = k;
+    b.innerHTML = '<b>' + A.name + '</b><small>' + A.desc + '（' + A.cd + '秒ごと）</small>' + (window.__isTouch ? '' : '<kbd>' + i + '</kbd>');
+    b.setAttribute('aria-pressed', String(oni.ab[abp.side] === k));
+    b.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
+    b.addEventListener('click', (e) => { e.stopPropagation(); pickAb(k); });
+    host.appendChild(b);
+  }
+}
+function pickAb(k) {
+  if (!abp.on) return;
+  oni.ab[abp.side] = k; oniSave(); renderAbPick(); if (typeof renderOniMenu === 'function') renderOniMenu();
+  if (abp.why === 'caught') setTimeout(hideAbPick, 350);
+}
+function hideAbPick() { abp.on = false; $('abpick').hidden = true; document.body.classList.remove('abpicking'); }
+window.addEventListener('keydown', (e) => {
+  if (!abp.on || !/^Digit[1-4]$/.test(e.code)) return;
+  const n = +e.code.slice(5), keys2 = Object.entries(ONI.ABIL).filter(([, A]) => A.side === abp.side).map(([k]) => k);
+  if (keys2[n - 1]) { e.preventDefault(); e.stopImmediatePropagation(); pickAb(keys2[n - 1]); }
+}, true);
+function abPickFrame() {
+  if (!abp.on) return;
+  const left = (abp.until - performance.now()) / 1000;
+  $('ap-bar').style.width = Math.max(0, left / abp.dur * 100).toFixed(1) + '%';
+  if (left <= 0 || !oni.active || res.on || title.on) hideAbPick();
+}
+
 
 course.prevPos.copy(S.pos);
 loadMap(mapId);
+titleShow('main');
 requestAnimationFrame(frame);
 })();
 
@@ -3333,7 +3822,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261029-5';
+(() => { const B = 'oni-20261029-6';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
