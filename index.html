@@ -3114,6 +3114,100 @@ function botWander(b) {
   }
   return _bd.copy(b.wp).sub(b.pos);
 }
+// ---------- ボットの道さがし（壁にはまらないように）----------
+// 飛べる場所の地図（oniNav のマス目）の上で、行き先までの最短の道を探す
+// マス目の番号を1つの数にまとめる（文字列より速い）
+const BNK = (i, j, k) => ((i + 512) * 1024 + (j + 512)) * 1024 + (k + 512);
+function botNavSet() {
+  if (oniNav._nset && oniNav._nsetSrc === oniNav.set && oniNav._nsetN === oniNav.list.length) return oniNav._nset;
+  const ns = new Set(); for (const v of oniNav.list) ns.add(BNK(v[0], v[1], v[2]));
+  oniNav._nset = ns; oniNav._nsetSrc = oniNav.set; oniNav._nsetN = oniNav.list.length; return ns;
+}
+function botNavCell(p) {
+  const NS = botNavSet(), v = oniNav.cell(p.x, p.y, p.z);
+  let best = null, bd = 1e9;
+  for (let r = 0; r <= 2 && !best; r++) for (let a = -r; a <= r; a++) for (let b = -r; b <= r; b++) for (let c = -r; c <= r; c++) {
+    const w = [v[0] + a, v[1] + b, v[2] + c]; if (!NS.has(BNK(w[0], w[1], w[2]))) continue;
+    const q = oniNav.center(w), d = (q[0] - p.x) ** 2 + (q[1] - p.y) ** 2 + (q[2] - p.z) ** 2; if (d < bd) { bd = d; best = w; }
+  }
+  return best;
+}
+// 2点のあいだを、壁にぶつからずにまっすぐ飛べるか
+function botClear(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z, L = Math.hypot(dx, dy, dz); if (L < 1e-3) return true;
+  if (oniRayHit(grid, a.x, a.y, a.z, dx / L, dy / L, dz / L, L)) return false;
+  for (let s = 1; s < L; s += 1) if (clearance(grid, a.x + dx / L * s, a.y + dy / L * s, a.z + dz / L * s, 0.6) < 0.45) return false;
+  return true;
+}
+const BOT_N26 = (() => { const o = []; for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) if (a || b || c) o.push([a, b, c, Math.hypot(a, b, c)]); return o; })();
+function botPath(from, to, limit) {
+  if (!oniNav.done || !oniNav.list.length) return null;
+  const NS = botNavSet(), s = botNavCell(from), g = botNavCell(to); if (!s || !g) return null;
+  const gk = BNK(g[0], g[1], g[2]);
+  const H = (i, j, k) => Math.hypot(i - g[0], j - g[1], k - g[2]);
+  // 二分ヒープ（[f, g, i, j, k] を平らな配列で持つ）
+  const hf = [], hd = [];
+  const push = (f, d) => { hf.push(f); hd.push(d); let i = hf.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (hf[p] <= hf[i]) break; [hf[p], hf[i]] = [hf[i], hf[p]]; [hd[p], hd[i]] = [hd[i], hd[p]]; i = p; } };
+  const pop = () => { const top = hd[0], lf = hf.pop(), ld = hd.pop(); if (hf.length) { hf[0] = lf; hd[0] = ld; let i = 0; for (;;) { const l = i * 2 + 1, r = l + 1; let m = i; if (l < hf.length && hf[l] < hf[m]) m = l; if (r < hf.length && hf[r] < hf[m]) m = r; if (m === i) break; [hf[m], hf[i]] = [hf[i], hf[m]]; [hd[m], hd[i]] = [hd[i], hd[m]]; i = m; } } return top; };
+  const gs = new Map(), came = new Map(), sk = BNK(s[0], s[1], s[2]);
+  gs.set(sk, 0); push(H(s[0], s[1], s[2]), [0, s[0], s[1], s[2], sk]);
+  let bestK = sk, bestH = H(s[0], s[1], s[2]), n = 0; const LIM = limit || 2500;
+  while (hf.length && n++ < LIM) {
+    const [gc, i, j, k, key] = pop();
+    if (gc > gs.get(key)) continue;
+    if (key === gk) { bestK = key; break; }
+    const h = H(i, j, k); if (h < bestH) { bestH = h; bestK = key; }
+    for (const [a, b, c, cost] of BOT_N26) {
+      const wi = i + a, wj = j + b, wk = k + c, kk = BNK(wi, wj, wk); if (!NS.has(kk)) continue;
+      if (cost > 1 && !(NS.has(BNK(wi, j, k)) || NS.has(BNK(i, wj, k)) || NS.has(BNK(i, j, wk)))) continue;   // 角をすり抜けない
+      const ng = gc + cost, og = gs.get(kk); if (og !== undefined && ng >= og) continue;
+      gs.set(kk, ng); came.set(kk, key); push(ng + H(wi, wj, wk), [ng, wi, wj, wk, kk]);
+    }
+  }
+  const pts = []; let key = bestK;
+  while (key !== undefined) { const k = key % 1024 - 512, j = Math.floor(key / 1024) % 1024 - 512, i = Math.floor(key / 1048576) - 512; const c = oniNav.center([i, j, k]); pts.push(new THREE.Vector3(c[0], c[1], c[2])); key = came.get(key); }
+  pts.reverse(); if (pts.length) pts.shift();
+  if (bestK === gk) pts.push(to.clone());
+  return pts;
+}
+// 逃げる先: 鬼から遠く、自分からそれほど遠くない場所
+function botFleeSpot(b, ents) {
+  let best = null, bs = -1e9;
+  for (let k = 0; k < 24; k++) {
+    const q = oniNav.random(); if (!q) break;
+    let dmin = 1e9; for (const e of ents) if (e.id !== b.id && roleOf(e.id) === 'oni') dmin = Math.min(dmin, e.pos.distanceTo(q));
+    const sc = Math.min(dmin, 60) - q.distanceTo(b.pos) * 0.35;
+    if (sc > bs) { bs = sc; best = q; }
+  }
+  return best;
+}
+// 壁にぶつかったら、ぶつかった向きだけ止めて、ほかの向きには滑らせる
+function botMove(b, dt) {
+  _bq.copy(b.pos);
+  for (const ax of ['x', 'y', 'z']) {
+    const old = b.pos[ax]; b.pos[ax] += b.vel[ax] * dt;
+    if (clearance(grid, b.pos.x, b.pos.y, b.pos.z, 0.5) < 0.32) { b.pos[ax] = old; b.vel[ax] *= -0.2; }
+  }
+  if (b.pos.y < MAP.groundY + 0.4) b.pos.y = MAP.groundY + 0.4;
+  if (oniClamp(b.pos, b.vel) && clearance(grid, b.pos.x, b.pos.y, b.pos.z, 0.5) < 0.32) { b.pos.copy(_bq); b.vel.set(0, 0, 0); }
+}
+// しばらく進めていなければ、道を探し直す（それでもだめなら近くの飛べる場所へ移す）
+function botUnstick(b, dt) {
+  b.stkT = (b.stkT || 0) + dt;
+  if (!b.stkP) b.stkP = b.pos.clone();
+  if (b.stkT < 1.2) return;
+  const moved = b.stkP.distanceTo(b.pos); b.stkT = 0; b.stkP.copy(b.pos);
+  const wantsToGo = b.pathGoal && b.pathGoal.distanceTo(b.pos) > 3;
+  if (moved > 0.6 || !wantsToGo) { b.stkN = 0; return; }
+  b.stkN = (b.stkN || 0) + 1;
+  if (b.stkN === 1) { b.path = null; b.flee = null; return; }        // まずは道を探し直す
+  // それでも進めないときは、道の次の地点（なければ近くの飛べる場所）へ移す
+  let to = null;
+  if (b.path) for (const q of b.path.slice(0, 3)) if (clearance(grid, q.x, q.y, q.z, 0.6) > 0.45) { to = q; break; }
+  if (!to && oniNav.done) { const v = botNavCell(b.pos); if (v) { const c = oniNav.center(v); to = new THREE.Vector3(c[0], c[1], c[2]); } }
+  if (to) { b.pos.copy(to); b.vel.set(0, 0, 0); }
+  b.path = null; b.wp = null; b.flee = null; b.stkN = 0;
+}
 function botFrame(dt) {
   if (!BOT.on) return;
   if (res.on) { const rb = $('res-ready'); rb.hidden = false; rb.setAttribute('aria-pressed', 'false'); rb.textContent = 'もう一回（ボットと）'; $('res-stat').textContent = 'ボットと対戦中。「閉じて自由に飛ぶ」でボットと別れます。'; }
@@ -3125,6 +3219,7 @@ function botFrame(dt) {
     for (const b of BOT.list) if (b.id === l.by || b.id === l.to) { b.freezeUntil = now + ONI.ACT * 1000; b.vel.set(0, 0, 0); b.inRange = 0; }
   }
   // 参加者（自分＋ボット）の位置と役割
+  BOT.frameNo = (BOT.frameNo || 0) + 1;
   const ents = [{ id: NET.myPeer, pos: S.pos, me: true }].concat(BOT.list.map((b) => ({ id: b.id, pos: b.pos, bot: b })));
   for (const b of BOT.list) {
     const role = roleOf(b.id);
@@ -3152,11 +3247,28 @@ function botFrame(dt) {
         _bv.copy(b.pos).sub(e.pos); const d = Math.max(1, _bv.length());
         if (d < 32) { _bd.addScaledVector(_bv.normalize(), 1 / (d * d)); threat = true; }
       }
-      if (threat) { want = _bd; spd *= 1.0; } else spd *= 0.6;          // 鬼がいないときはゆっくり見回る
+      if (threat) {
+        if (oniNav.done) { if (!b.flee || b.flee.distanceTo(b.pos) < 3 || (b.fleeT = (b.fleeT || 0) - dt) <= 0) { b.flee = botFleeSpot(b, ents); b.fleeT = 2.5; } if (b.flee) want = _bd.copy(b.flee).sub(b.pos); else want = _bd; }
+        else want = _bd;
+      } else { spd *= 0.6; b.flee = null; }          // 鬼がいないときはゆっくり見回る
     }
     if (!want || want.lengthSq() < 1e-6) want = botWander(b);
-    const goal = _bv.copy(want).normalize();
-    // 進める方向の中で、行きたい方向にいちばん近いものを選ぶ（0.2秒ごと）
+    let goal = _bv.copy(want).normalize();
+    // 飛べる場所の地図があれば、行き先までの道をたどる
+    if (oniNav.done) {
+      const tgt = _bq.copy(b.pos).add(want);
+      b.pathT = (b.pathT || 0) - dt;
+      // 道の探し直しは 1フレームに1体まで（重くならないように）
+      if ((!b.path || b.pathT <= 0 || !b.pathGoal || b.pathGoal.distanceTo(tgt) > 4) && BOT.planned !== BOT.frameNo) { BOT.planned = BOT.frameNo; b.path = botPath(b.pos, tgt); b.pathGoal = tgt.clone(); b.pathT = 0.8 + Math.random() * 0.5; }
+      if (b.path) {
+        while (b.path.length && b.path[0].distanceTo(b.pos) < 1.2) b.path.shift();
+        b.skipT = (b.skipT || 0) - dt;
+        if (b.path.length > 1 && b.skipT <= 0) { b.skipT = 0.25; if (botClear(b.pos, b.path[1])) b.path.shift(); }
+        if (b.path.length) goal = _bv.copy(b.path[0]).sub(b.pos).normalize();
+      }
+      b.dir.lerp(goal, 1 - Math.exp(-dt * 8)).normalize();
+      b.replan = 1;
+    }
     b.replan -= dt;
     if (b.replan <= 0) {
       b.replan = 0.2;
@@ -3165,10 +3277,7 @@ function botFrame(dt) {
       if (best) b.dir.copy(best); else b.dir.set(0, 1, 0);
     }
     b.vel.lerp(_bq.copy(b.dir).multiplyScalar(spd), 1 - Math.exp(-dt * 3));
-    _bq.copy(b.pos); b.pos.addScaledVector(b.vel, dt);
-    if (clearance(grid, b.pos.x, b.pos.y, b.pos.z, 0.5) < 0.32) { b.pos.copy(_bq); b.vel.multiplyScalar(-0.3); b.replan = 0; }
-    if (b.pos.y < MAP.groundY + 0.4) b.pos.y = MAP.groundY + 0.4;
-    if (oniClamp(b.pos, b.vel) && clearance(grid, b.pos.x, b.pos.y, b.pos.z, 0.5) < 0.32) { b.pos.copy(_bq); b.vel.set(0, 0, 0); b.replan = 0; }
+    botMove(b, dt); botUnstick(b, dt);
     // 敵どうしでぶつかったら弾かれる（バンプ）
     const myRole = oni.role;
     if (myRole && role !== myRole) { _bv.copy(b.pos).sub(S.pos); const d = _bv.length(); if (d < 0.6 && d > 1e-4) b.pos.addScaledVector(_bv.normalize(), 0.6 - d); }
@@ -3304,6 +3413,7 @@ const oniNav = {
     for (let i = 0; i < raw.length; i++) { const byte = raw.charCodeAt(i); if (!byte) continue;
       for (let bit = 0; bit < 8; bit++) if (byte & (1 << bit)) { const idx = i * 8 + bit, c = idx % n[2], b = Math.floor(idx / n[2]) % n[1], a = Math.floor(idx / (n[1] * n[2])); const v = [o[0] + a, o[1] + b, o[2] + c]; set.add(v[0] + ',' + v[1] + ',' + v[2]); list.push(v); } }
     this.h = d.h; this.set = set; this.list = list; this.queue = null; this.done = true;
+    if (typeof botNavSet === 'function') botNavSet();
   },
   cell(x, y, z) { const h = this.h; return [Math.floor(x / h), Math.floor(y / h), Math.floor(z / h)]; },
   key(x, y, z) { const v = this.cell(x, y, z); return v[0] + ',' + v[1] + ',' + v[2]; },
@@ -3829,7 +3939,7 @@ body.touch #players{top:calc(50px + env(safe-area-inset-top,0px));font-size:11px
 
 <script>
 // 古いページがブラウザに残っていたら、最新版を読み直す（更新が届かない問題の対策）
-(() => { const B = 'oni-20261029-7';
+(() => { const B = 'oni-20261030-1';
   fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
     const m = t.match(/const B = '([^']+)'/); if (!m || m[1] === B) return;
     const q = new URLSearchParams(location.search); if (q.get('v') === m[1]) return; q.set('v', m[1]);
